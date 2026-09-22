@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+
+<!-- viewport-fit=cover lets the page paint under the notch and the home
+     indicator. That is only safe because css/app.css pays for it: every edge-
+     pinned thing (the play strip, the hand dock, the banners, the footer) adds
+     env(safe-area-inset-*) to its padding. Without those rules this line would
+     put the hand dock under the home bar on an iPhone. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+<title>Judgement</title>
+<meta name="description" content="Judgement (Kachuful / Oh Hell) for three to seven players. Peer-to-peer in the browser — no server, no accounts, no install.">
+
+<!-- Matches --bg in css/app.css. Colours the browser chrome on Android and the
+     status bar area of an installed PWA, so the app does not sit in a white
+     frame. If --bg changes, change this too; there is no way to derive one
+     from the other without script. -->
+<meta name="theme-color" content="#120711">
+
+<!-- EVERY PATH IN THIS FILE IS RELATIVE ("./x"), never root-relative ("/x").
+     GitHub Pages serves a project site from /<repo>/, so "/css/app.css" would
+     resolve to the user site root and 404. Relative paths work both there and
+     from a file:// double-click. -->
+<link rel="manifest" href="./manifest.webmanifest">
+
+<!-- Two sizes rather than one, because a browser picks the nearest and then
+     scales: handing it only the 192 leaves it shrinking a tilted card down to
+     a 16px tab favicon, which turns the edges to mush. icon-32.png is DRAWN at
+     32, not downscaled — see scripts/gen-icons.js. -->
+<link rel="icon" href="./icons/icon-32.png" sizes="32x32" type="image/png">
+<link rel="icon" href="./icons/icon-192.png" sizes="192x192" type="image/png">
+
+<!-- iOS ignores the manifest's icons for "Add to Home Screen" and reads this
+     instead. It also applies its own rounded mask and composites over nothing,
+     so the file must be opaque to the edge — it is; every icon paints the
+     background gradient across the whole tile. -->
+<link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+
+<!-- The three faces css/app.css names in --mono / --serif / --sans. Loaded from
+     a CDN and deliberately NOT precached by sw.js: fonts are the one thing here
+     that degrades gracefully on its own, because every custom family in the
+     token block is declared with a real system fallback behind it. Offline you
+     get Georgia and system-ui and the layout is unchanged.
+     `display=swap` so text paints immediately in the fallback rather than
+     hanging invisible while a third party is slow. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap">
+
+<link rel="stylesheet" href="./css/app.css">
+
+<!-- PEERJS, AND WHY IT IS A <script> TAG RATHER THAN AN import.
+     js/net.js explains the whole argument; the short version is that PeerJS
+     ships as a UMD bundle, is read off window.Peer, and is never imported by
+     any module — which is what keeps package.json's "no dependencies" claim
+     literally true rather than merely aspirational.
+
+     `defer` matters for ordering, not just for speed. Deferred classic scripts
+     and module scripts share one execution queue and run in document order
+     after parsing, so this bundle is guaranteed to have run before
+     ./js/main.js evaluates — and main.js's resume() can call peerAvailable()
+     during evaluation when it finds a live session to rejoin.
+
+     There is no integrity="sha384-…" here on purpose. An SRI hash that does not
+     match the byte-for-byte file the CDN serves blocks the script silently and
+     bricks all multiplayer, and the hash cannot be verified from inside this
+     repo. js/net.js's peerAvailable() is the compensating control: it checks
+     for window.Peer before every use and routes a missing bundle into the same
+     error screen as a blocked CDN or an offline first load, rather than
+     throwing "Peer is not a constructor" out of a click handler. -->
+<script defer src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<script type="module" src="./js/main.js"></script>
+</head>
+
+<body>
+
+<!-- ==========================================================================
+     #app AND ITS THREE SIBLINGS
+
+     js/ui.js's render() opens with clear(root) and rebuilds every child of #app
+     from scratch on every frame. Anything that must survive a frame therefore
+     cannot live inside it. That is the single reason for the shape of this
+     file, and it applies to all three siblings below for three different
+     reasons.
+     ========================================================================== -->
+
+<div id="app"></div>
+
+<!-- 1. THE LIVE REGION — survives because a rebuilt region is a silent one.
+     A screen reader announces a live region when the text INSIDE AN ALREADY-
+     PRESENT node changes. A region destroyed and recreated each frame is a
+     brand new node every time and therefore announces nothing, ever. So this
+     one is written once, here, and main.js's speak() copies the frame's
+     [data-announce] text into it — and only when the text actually changed, or
+     every unrelated repaint would re-read the same sentence.
+
+     role="status" is the polite one: it waits for a pause rather than cutting
+     across what is being read. aria-atomic re-reads the whole sentence rather
+     than just the words that differ.
+
+     .sr-only rather than hidden or display:none — those remove it from the
+     accessibility tree entirely, which is the usual way this gets broken. -->
+<div id="announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<!-- 2. THE FOOTER — survives because it is chrome, not game.
+     It is hidden outright while a board is on screen (body.in-play in
+     css/app.css, set by main.js from the class the renderer emitted), because
+     the play screen pins a strip to the top edge and the hand dock to the
+     bottom and has no room for anything underneath. -->
+<footer class="site-footer">
+  <span>Judgement</span>
+  <span class="sep">·</span>
+  <span>Peer-to-peer. No server, no accounts.</span>
+
+  <!-- THE ESCAPE HATCH. Its handler is at the bottom of this file in a plain
+       inline script, not in js/main.js, and that is deliberate: this is the
+       button you press BECAUSE the app is broken. A stale service worker
+       serving a half-updated shell is exactly the failure it exists for, and
+       in that state ./js/main.js may be the thing that failed to load. A
+       recovery control that depends on the thing it recovers from is not a
+       recovery control. -->
+  <button type="button" class="footer-reset" id="reset-btn">Clear cache &amp; reload</button>
+</footer>
+
+<!-- 3. THE RULES SHEET — survives because it is static prose and a <dialog>.
+     js/ui.js wires intents.toggleRules() onto the "?" — in the wordmark on
+     the screens that have one, and in the play strip on the screens that do
+     not, because the moment somebody needs the rules is the moment they are
+     holding cards — but renders no sheet itself, which is right twice over.
+
+     STATIC PROSE MEANS NOTHING KEEPS IT HONEST, and it has already drifted
+     once: the Squared bullet described a linear penalty for years while
+     scoreSquare() in js/scoring.js squared the error. scripts/test-engine.mjs
+     now scores the hypothetical rounds this text names and checks the numbers
+     against what comes back, so the prose is pinned to the formula rather
+     than to whoever last remembered it. The text never changes,
+     so rebuilding it sixty times a second is pure waste; and a native <dialog>
+     opened with showModal() brings a focus trap, Escape-to-close and inertness
+     for everything behind it for free — three things that are tedious to do
+     correctly by hand and are the usual casualties of a hand-rolled overlay.
+     main.js's toggleRules() just calls .showModal() / .close() on this node. -->
+<dialog id="rules" aria-labelledby="rules-title">
+  <div class="rules-inner">
+    <h2 id="rules-title">How to play</h2>
+    <p>Judgement — also called Kachuful, or Oh Hell — is a trick-taking game for three to seven players. You are scored on <b>predicting exactly how many tricks you will take</b>, not on taking as many as possible.</p>
+
+    <h3>A round</h3>
+    <p>Everyone is dealt the same number of cards. A trump suit is set. Each player says how many tricks they think they will win. Then the hand is played out, and you are scored on whether you were right.</p>
+    <p>The round sizes change as the match goes: down from the biggest hand the deck allows to a single card and back up again, or just the one descent, depending on the shape the host picked.</p>
+
+    <h3>Bidding</h3>
+    <p>Bids go round in turn and are <b>public the moment they are made</b> — you can see what everyone before you has said, and they can see yours once you submit it.</p>
+    <p>The dealer bids last. If the host has <b>the hook</b> switched on — it is on by default — the dealer may not make the bids add up to the number of tricks available. Somebody at the table then has to be wrong, which is what stops a round where everybody quietly gets what they asked for. With the hook off, the dealer may bid anything and a whole table can make it.</p>
+
+    <h3>Playing</h3>
+    <p>Play moves <b>clockwise</b>. The winner of a trick leads the next one.</p>
+    <p>You <b>must follow the led suit if you can</b>. If you cannot, you may play anything, including a trump. The highest trump wins the trick; if no trump was played, the highest card of the led suit wins.</p>
+
+    <h3>Trump</h3>
+    <ul>
+      <li><b>Rotation</b> — a fixed cycle, so everyone knows the trump before the deal.</li>
+      <li><b>Turned card</b> — the top card of what is left is flipped after the deal and its suit is trump.</li>
+      <li><b>Rotation with No Trump</b> — as rotation, but every fifth round has no trump at all and the led suit is the only thing that wins.</li>
+    </ul>
+
+    <h3>Scoring</h3>
+    <p>You score only if you take <b>exactly</b> what you bid. The host picks which way that pays:</p>
+    <ul>
+      <li><b>Kachuful</b> — ten times your bid. A made bid of four scores 40. Missing costs nothing, so bid boldly. A made zero pays five times the round size, which makes ducking a ten-card round worth 50.</li>
+      <li><b>Standard</b> — ten plus your bid. A made four scores 14, a made zero scores 10. Ambition buys you almost nothing; accuracy buys you everything.</li>
+      <li><b>Squared</b> — ten plus your bid squared, so a made four scores 26 — and <b>missing takes points away</b>: the square of how far out you were, and nothing else. Out by one costs 1, out by two costs 4, out by three costs 9. Over and under cost the same, so once you have made your bid an extra trick hurts exactly as much as one you failed to take. The only mode where a score can go negative, and the only one where the timid bid is sometimes the right one.</li>
+    </ul>
+
+    <h3>Playing together</h3>
+    <p>One person hosts and shares the four-character room code; everyone else joins with it. The connection is <b>directly between your devices</b> — there is no server holding the game.</p>
+    <p>If your phone dies or your browser closes, rejoin with the same code on the same device and <b>you get your seat and your full scoreboard back</b>. The host's device is the one that must stay: if it leaves, the match ends.</p>
+  </div>
+
+  <!-- method="dialog" closes the dialog natively on submit. No script, and it
+       keeps working if main.js never loaded. -->
+  <form method="dialog" class="rules-close-row">
+    <button class="btn btn-ghost btn-wide" value="close">CLOSE</button>
+  </form>
+</dialog>
+
+<!-- ==========================================================================
+     THE SHELL SCRIPT
+
+     A plain classic script, not a module, and not part of js/. Everything in
+     here is about the PAGE rather than the GAME, and all of it has to work on
+     the occasions when the game does not load at all.
+     ========================================================================== -->
+<script>
+(function () {
+  'use strict';
+
+  // -- Service worker ------------------------------------------------------
+  // Registered from here rather than from js/main.js so that an offline second
+  // visit still gets a cached shell even if the module graph is broken.
+  //
+  // './sw.js' is relative, which also sets the SCOPE to this directory — the
+  // correct scope under a GitHub Pages project subpath, where a root-scoped
+  // worker would be rejected outright.
+  //
+  // Skipped on file:// because service workers are not available there and the
+  // rejection is a noisy console error rather than a useful one.
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    window.addEventListener('load', function () {
+      // Failure is genuinely fine: no worker means no offline support, and the
+      // app works exactly as well as it did before there was one. Swallowing
+      // this is not hiding a bug, it is declining to turn a missing nicety
+      // into a console error on every load.
+      navigator.serviceWorker.register('./sw.js').catch(function () {});
+    });
+  }
+
+  // -- Clear cache & reload ------------------------------------------------
+  var btn = document.getElementById('reset-btn');
+  if (!btn) return;
+
+  btn.addEventListener('click', function () {
+    // ###################################################################
+    //
+    //  THIS BUTTON MUST NEVER TOUCH localStorage.
+    //
+    //  It is tempting to make it a "reset everything", and that would be
+    //  destructive in a way that cannot be undone. localStorage holds
+    //  judgement.clientId — the 128-bit ticket that IS a player's claim to
+    //  their seat. Clearing it mid-match does not sign you out and let you
+    //  back in; it makes you a stranger to the host, so the rejoin is
+    //  refused and your seat and your whole scoreboard are gone for the
+    //  rest of a nineteen-round match. It would also drop
+    //  judgement.engine, which is the host's only copy of the game.
+    //
+    //  So: Cache Storage and service worker registrations ONLY. Those are
+    //  derived data — every byte in them can be fetched again — which is
+    //  exactly what makes them safe to throw away and makes the stale
+    //  shell they cause worth a button.
+    //
+    // ###################################################################
+    btn.disabled = true;
+    btn.textContent = 'Clearing…';
+
+    var jobs = [];
+
+    if ('serviceWorker' in navigator) {
+      jobs.push(
+        navigator.serviceWorker.getRegistrations().then(function (regs) {
+          return Promise.all(regs.map(function (r) { return r.unregister(); }));
+        })
+      );
+    }
+
+    if ('caches' in window) {
+      jobs.push(
+        caches.keys().then(function (keys) {
+          return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+        })
+      );
+    }
+
+    // Reload either way. If the clearing failed, the reload is still the most
+    // useful thing that can happen next, and leaving the button stuck on
+    // "Clearing…" would be the worst of both.
+    Promise.all(jobs)
+      .catch(function () {})
+      .then(function () { location.reload(); });
+  });
+}());
+</script>
+
+</body>
+</html>

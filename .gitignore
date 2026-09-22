@@ -1,0 +1,37 @@
+# Scratch work, not the project.
+#
+# Everything here is a THROWAWAY: one-shot probes written to answer one
+# question, mutation tables written to prove the suite bites, and their
+# captured output. They are kept rather than deleted because re-proving a
+# check next time is cheaper than rewriting the table that proves it — but
+# they are not part of the build, nobody should have to read them, and they
+# must never reach a commit.
+#
+# The convention is the leading underscore, and it is the whole rule: a file
+# named _anything is scratch. Everything without one is the project.
+#
+# NOT ignored, and deliberately so:
+#   scripts/test-engine.mjs   the suite itself
+#   scripts/domshim.mjs       the DOM the suite renders into, headless
+#   scripts/peershim.mjs      the transport the suite talks over, headless
+#   scripts/gen-icons.js      generates icons/, which ships
+_*
+
+# ...but the shipped page is index.html, and no underscore file is loaded by
+# it. If that ever stops being true, this pattern is the thing that hides it.
+
+# Editor/session state. .claude/ holds per-machine launch settings and
+# transcripts, neither of which belong to anybody else checking this out.
+.claude/
+
+# OS and editor litter.
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# There are no dependencies — package.json has no "dependencies" key and the
+# page loads ES modules straight from js/. node_modules/ should never appear;
+# it is listed so that if some tool creates one, it does not get committed by
+# somebody who did not notice.
+node_modules/
