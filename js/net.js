@@ -314,15 +314,46 @@ export function connIdForPlayer(playerId) {
 // file and read in another is two opinions about a format, and they drift. The
 // pair cannot.
 //
-// Three types is the whole protocol on top of the intents. Anything else that
+// Four types is the whole protocol on top of the intents. Anything else that
 // arrives is handed to the caller's onData, where applyGameIntent() gets a
 // look at it and an unrecognised type is a no-op — which is what lets a newer
 // client talk to an older host without either of them crashing.
+//
+// ---------------------------------------------------------------------------
+// WHY THE FOURTH ONE EXISTS, WHEN THREE WAS THE POINT
+// ---------------------------------------------------------------------------
+// It was three, and the fourth is not a convenience. A seat is claimed by
+// clientId, and a clientId is per-DEVICE, not per-tab: two tabs of the same
+// browser read the same localStorage and therefore dial with the same ticket.
+// The second one reclaims the seat and the host retires the first one's
+// channel, which is correct and is the whole reconnect story — a phone that
+// comes back out of a tunnel is exactly this.
+//
+// What is NOT correct is what the first tab then does. A closed channel is
+// indistinguishable from a channel that died, so it redials; redialling wins
+// the seat back; and the tab that just took it gets retired in turn. Two tabs
+// will do that to each other until one of them is closed, and neither shows
+// anything but a spinner while it happens.
+//
+// The host cannot tell the two cases apart — a dying phone and a second tab
+// look identical from here, and any test that tried (timing, user agent, how
+// recently the seat spoke) would guess wrong on somebody's train. So this
+// frame does not try. It carries no decision, only a fact the OLD connection
+// cannot observe for itself: you were not dropped, you were superseded. What
+// to do about that is the client's business, and js/main.js's answer is to
+// stop redialling and say so.
+//
+// It is best-effort by construction. It is sent immediately before the channel
+// is closed, so a real DataChannel can lose it in flight; when that happens the
+// behaviour degrades to exactly what it was before this frame existed, which is
+// why the guard is here and not the only thing standing between two tabs and a
+// loop.
 // ---------------------------------------------------------------------------
 export const WIRE = Object.freeze({
   JOIN: 'join',          // client -> host, once per connection, on open
   STATE: 'state',        // host -> client, on every change
   REJECTED: 'rejected',  // host -> client, a refusal meant for the sender alone
+  REPLACED: 'replaced',  // host -> client, last words: your seat moved elsewhere
 });
 
 /** A refusal is one sentence for a human, so it is capped at one sentence's
@@ -427,6 +458,35 @@ export function readRejectFrame(msg) {
   if (!msg || msg.type !== WIRE.REJECTED) return null;
   const text = typeof msg.message === 'string' ? msg.message.slice(0, MAX_REJECT_LEN).trim() : '';
   return text || 'The host refused that.';
+}
+
+/**
+ * Last words to a connection whose seat has just been reclaimed by another
+ * one holding the same ticket. See the long note above WIRE for why this is a
+ * frame and not a heuristic.
+ *
+ * IT CARRIES NOTHING, and the empty payload is the design rather than an
+ * omission. The seat number, the name, the new peer's id — all of it is either
+ * already in the last state frame this connection received or is none of its
+ * business now, and every field added here is a field the reader below has to
+ * be suspicious of. The fact IS the frame.
+ */
+export function replacedFrame() {
+  return { type: WIRE.REPLACED };
+}
+
+/**
+ * A predicate, not a read-into-an-object, because there is nothing to read.
+ * The pair still exists for the reason the others do: the type string is
+ * written in one file and matched in another, and one of them gets renamed.
+ *
+ * NO NEW AUTHORITY IS GRANTED BY BELIEVING THIS. The host on the other end of
+ * a mistyped room code could send it unprompted — and could equally just close
+ * the channel, which is strictly worse for the player and needs no frame at
+ * all. So there is nothing here worth authenticating.
+ */
+export function isReplacedFrame(msg) {
+  return !!msg && msg.type === WIRE.REPLACED;
 }
 
 // ---------------------------------------------------------------------------
@@ -828,8 +888,14 @@ export function createHost(code, handlers = {}) {
 /**
  * Dial the host at the address derived from `code`.
  *
- * handlers: onOpen(), onState(pub, priv), onData(msg), onClose(), onError(err),
- *           onBrokerDown(), onBrokerUp(), onBrokerLost()
+ * handlers: onOpen(), onState(pub, priv), onReplaced(), onData(msg), onClose(),
+ *           onError(err), onBrokerDown(), onBrokerUp(), onBrokerLost()
+ *
+ * onReplaced() is immediately followed by onClose(), always — the host sends
+ * the frame and then closes the channel. A caller that acts on the first must
+ * therefore make the second inert, because the close by itself is
+ * indistinguishable from a dropped connection and "reconnect" is the right
+ * answer to that one.
  *
  * `identity` is { name, clientId }. When it is given — which is every real
  * call — the JOIN frame is sent by this function, on open, before onOpen fires,
@@ -887,6 +953,17 @@ export function joinHost(code, handlers = {}, identity = null) {
         const frame = readStateFrame(msg);
         if (!frame) { bad += 1; return; }
         if (handlers.onState) handlers.onState(frame.pub, frame.priv);
+        return;
+      }
+
+      // Intercepted here rather than left to onData for the same reason STATE
+      // is: this one has consequences for the transport itself. The close that
+      // follows it must not be read as a dropped connection, and a caller that
+      // only ever sees onData has no way to get in front of that — by the time
+      // applyGameIntent() has shrugged at an unknown type, onClose has already
+      // fired and the redial is already scheduled.
+      if (isReplacedFrame(msg)) {
+        if (handlers.onReplaced) handlers.onReplaced();
         return;
       }
 

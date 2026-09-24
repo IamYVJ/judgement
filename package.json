@@ -6,6 +6,7 @@
   "description": "Static peer-to-peer web implementation of Judgement (Kachuful / Oh Hell).",
   "scripts": {
     "test": "node scripts/test-engine.mjs",
+    "stamp": "node scripts/test-engine.mjs --write-stamp",
     "icons": "node scripts/gen-icons.js",
     "serve": "python -m http.server 8000"
   },

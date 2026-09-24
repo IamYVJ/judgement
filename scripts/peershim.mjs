@@ -179,6 +179,10 @@ class FakeConn extends Emitter {
     this.closed = false;
     this.sent = [];          // everything this end put on the wire, for tests
     this.breakSend = false;  // make send() throw even while open
+    // Set ONLY by vanish(), and the difference between it and `open` is the
+    // difference between a channel that died and one that was closed. See the
+    // note on send() below.
+    this.dead = false;
     this._other = null;
   }
 
@@ -195,6 +199,27 @@ class FakeConn extends Emitter {
    * sent on after it closes, and js/net.js's trySend() exists for exactly that
    * — the `conn.open` check and the send are two statements, and a phone can
    * leave the building in between.
+   *
+   * -------------------------------------------------------------------------
+   * A SEND THAT BEATS A CLOSE STILL ARRIVES, and the `dead` flag rather than
+   * `open` is what makes that true.
+   * -------------------------------------------------------------------------
+   * This line used to re-check `other.open` at DELIVERY time, which meant a
+   * close() in the same tick threw away data that had already been handed to
+   * send(). That is not what a real channel does: closing an RTCDataChannel
+   * runs a closing procedure that transmits what is still in the buffer, and
+   * the InvalidStateError above is the spec's way of saying "too late" — it
+   * is thrown on the SEND, not applied retroactively to one that succeeded.
+   *
+   * It was found by js/main.js sending WIRE.REPLACED immediately before
+   * retiring a superseded connection. Every frame vanished, and the fix
+   * looked broken while being correct. A shim that is stricter than the real
+   * thing does not turn a real bug into a passing test — it does the other
+   * one, which is just as expensive to chase.
+   *
+   * vanish() still eats in-flight data, because that is the honest model of a
+   * phone in a tunnel and it is the reason these two states are now separate
+   * rather than sharing `open`.
    */
   send(data) {
     if (this.breakSend) throw new Error('InvalidStateError: simulated dead channel');
@@ -202,7 +227,7 @@ class FakeConn extends Emitter {
     this.sent.push(data);
     const other = this._other;
     if (!other) return;
-    soon(() => { if (other.open) other.emit('data', data); });
+    soon(() => { if (!other.dead) other.emit('data', data); });
   }
 
   close() {
@@ -223,7 +248,8 @@ class FakeConn extends Emitter {
    *  host has a reaper at all. */
   vanish() {
     this.open = false;
-    if (this._other) this._other.open = false;
+    this.dead = true;
+    if (this._other) { this._other.open = false; this._other.dead = true; }
   }
 }
 

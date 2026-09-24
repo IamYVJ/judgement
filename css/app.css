@@ -40,6 +40,17 @@
   --radius:    14px;
   --maxw:      640px;
 
+  /* The card's own size. A token and not two literals on .card, because the
+     fanned bidding hand has to cap each overlapping SLOT at the width of the
+     card inside it, and the slot is the card's parent — it cannot read a
+     value declared on its own child. The obvious alternative,
+     `max-width: min-content`, silently resolves to 0 there: the slot carries
+     `container-type: inline-size`, which is a promise to size without
+     consulting its contents, so its min-content IS zero and every card lands
+     on the same pixel. Measured that way once; the whole hand vanished. */
+  --card-w:    44px;
+  --card-h:    62px;
+
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --serif: 'Playfair Display', Georgia, serif;
   --sans: 'Inter', system-ui, -apple-system, sans-serif;
@@ -144,6 +155,12 @@ input { font: inherit; color: inherit; }
   max-width: var(--maxw);
   height: 100dvh;
 }
+
+/* The three phases each fill this middle band with their own rule further
+   down — .trick-area, .bid-wrap, .interstitial — and what they have in common
+   is fixed up in one place just after the last of them. See "the middle band"
+   below .interstitial. It has to live there and not here: all three set
+   justify-content themselves, and at equal specificity the later rule wins. */
 
 .wordmark { display: flex; align-items: center; gap: 9px; }
 .wordmark-dot {
@@ -456,12 +473,25 @@ input { font: inherit; color: inherit; }
    log block gives: an absent rule and a deliberate no-op rule look identical
    in a stylesheet, and only one of them survives someone tidying up.
 
-   It resolves to the same colour "under" does, so this changes nothing on
-   screen today. Whether it SHOULD — a seat still waiting to bid arguably wants
-   to read as muted, distinct from one that has bid and not got there yet — is
-   a design question, left alone deliberately. */
+   IT IS MUTED, AND "under" IS NOT. That is the one thing this pair decides.
+   During bidding the strip is answering one question — who are we still
+   waiting for — and the only marker for it is the small ▸ the .onmove rule
+   appends to the name. A row of full-brightness em-dashes competes with that
+   ▸ for the eye, so the seats that have nothing to say recede and the seat
+   that is being waited on is the one you land on. The bid numbers that ARE in
+   are the other thing worth reading, and they keep --text.
+
+   It matches .seat-name, which is already --muted: a seat with no bid is
+   uniformly quiet until it has something to report, and then the number
+   brightens while the name stays back.
+
+   Muted and not dimmed, because .seat.gone below is opacity 0.45 plus a
+   struck-through name and means something entirely different — that player is
+   not coming back to the keyboard. "Has not bid yet" is a normal thing that is
+   true of every seat once a round, and it must not wear the disconnection
+   look. Different channel: colour here, opacity there. */
 .seat.under .seat-score { color: var(--text); }
-.seat.nobid .seat-score { color: var(--text); }
+.seat.nobid .seat-score { color: var(--muted); }
 .seat.exact { border-color: var(--accent); background: var(--accent-dim); }
 .seat.exact .seat-score, .seat.exact .seat-name { color: var(--accent); }
 .seat.over .seat-score { color: var(--warn); text-decoration: line-through;
@@ -496,7 +526,7 @@ input { font: inherit; color: inherit; }
 
 /* --- the card ------------------------------------------------------------ */
 .card {
-  width: 44px; height: 62px; flex: none;
+  width: var(--card-w); height: var(--card-h); flex: none;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
   border-radius: 8px; border: 1px solid rgba(0,0,0,0.3);
   background: linear-gradient(170deg, var(--card), var(--card-2));
@@ -514,9 +544,14 @@ input { font: inherit; color: inherit; }
    is unchanged; it exists to be a <button> with a real hit area. */
 .card-btn {
   padding: 0; border: none; background: none;
-  flex: 1 1 0; min-width: 0; display: flex; justify-content: center;
+  flex: none; display: flex; justify-content: center;
 }
-.card-btn.static { flex: none; cursor: default; }
+/* The wrapper no longer divides the row — .hand sizes the face and the
+   wrapper shrink-wraps it — so `flex: none` lives on the base rule and this
+   one is left holding only the thing that is actually specific to a static
+   card. It is a <span> in the bidding hand and a <button> in the dock; the
+   cursor is the only difference that survives. */
+.card-btn.static { cursor: default; }
 .card-btn.sel .card {
   transform: translateY(-9px);
   box-shadow: 0 0 0 2px var(--accent), 0 10px 20px -8px rgba(0,0,0,0.7);
@@ -548,14 +583,108 @@ input { font: inherit; color: inherit; }
 .turn-hint { font-family: var(--mono); font-size: 10px; letter-spacing: 0.09em;
   text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
 .turn-hint.mine { color: var(--accent); }
-/* The whole hand is always on screen: cards divide the row rather than
-   scrolling. flex 1 1 0 with a max-width is also what makes a ONE-card round
-   render one normal card rather than one stretched one, which is the case the
-   brief says must not look broken. */
-.hand { display: flex; gap: clamp(3px, 1.4vw, 7px); padding: 2px 0 4px; min-width: 0; }
-.hand .card { flex: 1 1 0; min-width: 0; max-width: 58px; width: auto; height: 78px; }
+/* The whole hand is always on screen: cards keep a card's proportions and the
+   row WRAPS rather than scrolling. A one-card round still renders one normal
+   card rather than one stretched across the dock, which is the case the brief
+   says must not look broken.
+
+   This used to be `flex: 1 1 0` with `height: 78px`, so the width divided the
+   row with no floor while the height never moved. The ratio was the tell: a
+   real playing card is about 0.70 wide-to-tall, and at the default ten-card
+   round on a 375px phone that rule produced 30.4x78 — 0.39, a strip rather
+   than a card. By seventeen, the legal ceiling for three players, a card was
+   13.2px wide while the "10" it had to print is 19.8px, so the rank hung
+   outside the face it belonged to. Both numbers measured, not estimated.
+
+   THE FLOOR IS 38px BECAUSE OF ONE CASE, not because it is a round number.
+   Seven cards at 38px plus their gaps come to 292.9px, which is the last size
+   that still fits on one row inside the 296px a 320px phone has to offer —
+   and seven cards at a seven-player table is the commonest crowded game.
+   At 40px it comes to 306.9px, that table gains a second row, and on a
+   320x568 screen the dock is pushed off the bottom. Raising this to a tidier
+   number costs a real configuration its layout.
+
+   The row-gap is 10px and not the column gap, because .card-btn.sel lifts the
+   selected card 9px and that lift has to have somewhere to go that is not the
+   row above.
+
+   aspect-ratio repeats .card's 44/62 above, which is the one duplication in
+   here. scripts/test-engine.mjs parses both out of this file and fails if they
+   ever stop agreeing, rather than trusting the next person to notice. */
+.hand {
+  display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 10px clamp(3px, 1.4vw, 7px);
+  padding: 2px 0 4px; min-width: 0;
+}
+.hand .card { width: clamp(38px, 11vw, 58px); height: auto; aspect-ratio: 44 / 62; }
 .hand .card.illegal { opacity: 0.3; filter: saturate(0.35); }
 .action-row { display: flex; gap: 9px; margin-top: 10px; }
+
+/* --- the fanned hand (bidding only) -------------------------------------- */
+/*
+   Everything above assumes each card is a tap target and therefore needs its
+   own space. While bids are being taken nothing in the hand is tappable, so
+   the cards can overlap and the whole hand fits one row at any size. .hand.fan
+   is emitted by biddingHand() in js/ui.js and nowhere else.
+
+   Why it is worth a second layout: on this screen the dock is competing with a
+   bid pad whose button grid GROWS with the hand, so the tallest dock and the
+   tallest pad arrive together. That is the opposite of the play screen, where
+   a big hand implies few players and a small table, and it is why the wrapping
+   dock — fine on the play screen — costs 232px here exactly when there is
+   least to spare. Fanned it is 113px at every hand size.
+
+   Specificity does the switching: .hand.fan .card (0,2,1) beats .hand .card
+   (0,1,1), so the wrap geometry above stays the play screen's and is not
+   rewritten into a :not(). */
+.hand.fan { flex-wrap: nowrap; gap: 0; justify-content: center; }
+
+/* The SLOT is the thing that overlaps, not the card. Each slot grows to take
+   an equal share of the row and is then capped at one card width, so a small
+   hand packs tight in the middle instead of fanning out into separate cards
+   with gaps between them. The card inside keeps its normal size and simply
+   hangs out of the slot to the right, under its neighbour. */
+.hand.fan .card-btn {
+  flex: 1 1 0; min-width: 0; max-width: var(--card-w);
+  justify-content: flex-start;
+  container-type: inline-size;
+}
+/* The last card is whole — nothing paints over it. */
+.hand.fan .card-btn:last-child { flex: 0 0 var(--card-w); }
+/* Later siblings paint over earlier ones in DOM order, which is how a fan of
+   cards already works, so the overlap needs no z-index. Only the contents
+   move: into the top-left corner, because the corner is the part that stays
+   visible. The shadow falls left so each card reads as a separate card rather
+   than as one wide striped rectangle. */
+.hand.fan .card {
+  width: var(--card-w); height: var(--card-h); max-width: none; aspect-ratio: auto;
+  align-items: flex-start; justify-content: flex-start;
+  padding: 3px 0 0 3px; gap: 0;
+  box-shadow: -3px 0 5px -1px rgba(0,0,0,0.55);
+}
+/* Sized off the SLOT (cqw) and not the card, because the slot is the part you
+   can see. Holds 18px until the fan is tight enough that 18px would not fit.
+
+   The 10px floor is not a readability judgement — it is the largest number the
+   geometry allows. At the narrowest supported screen the sliver is as thin as
+   it ever gets:
+
+     available   = 320 - 2*12 (.hand-dock padding)  = 296
+     the last card is whole, so 16 slots share        296 - 44 = 252
+     sliver                                           252 / 16 = 15.75px
+
+   and what must fit in it is the 3px left padding plus the widest rank. That
+   is '10', two glyphs of a monospace face at ~0.6em each:
+
+     3 + 2 * 0.6 * font <= 15.75   ->   font <= 10.6px
+
+   11px was the first guess and it clipped the ten by 1.36px, because the rank
+   was checked against the sliver but drawn after the padding. The padding and
+   the floor are one constraint with two terms: widen the padding to 4px and
+   10px stops fitting either. scripts/test-engine.mjs re-derives this rather
+   than trusting the comment. */
+.hand.fan .card-rank { font-size: clamp(10px, 55cqw, 18px); }
+.hand.fan .card-suit { font-size: clamp(9px, 46cqw, 15px); }
 
 /* --- bidding ------------------------------------------------------------ */
 .bid-wrap { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center;
@@ -595,6 +724,41 @@ input { font: inherit; color: inherit; }
   text-transform: uppercase; color: var(--muted); margin: 0; line-height: 1.7;
 }
 .reveal { display: flex; flex-direction: column; align-items: center; gap: 11px; }
+
+/* --- the middle band ----------------------------------------------------- */
+/*
+   .trick-area, .bid-wrap and .interstitial are the same slot in the play
+   shell wearing three faces: the strip and the hand dock are `flex: none` and
+   pinned to opposite edges, and this is the one item that is supposed to give.
+   All three declare justify-content themselves, which is why this sits AFTER
+   the last of them rather than up beside .shell-play — at equal specificity
+   the later rule wins, and the `safe` below would have been quietly dropped.
+
+   min-height: 0 is the load-bearing declaration. `flex: 1 1 auto` reads like
+   "shrink me", but a flex item's automatic minimum size is its CONTENT size,
+   so an item with tall content will not shrink past it however large the
+   shrink factor is. The band then pushes the dock down, the shell is
+   height: 100dvh and does not scroll, and the hand you are being asked to bid
+   on sits below the bottom of the screen with no way to reach it. Measured on
+   a 320x568 phone the dock's bottom edge landed between 603px and 853px
+   depending on the table. This is not fallout from the wrapping hand: the old
+   one-row geometry overflowed too, 619-750px. Nothing ever made this
+   shrinkable.
+
+   overflow-y: auto is what the freed height is for. Once the band may be
+   shorter than its content, something has to let you reach the rest — and on
+   the bid screen the thing you must reach is the Bid button, which is the
+   band's last child.
+
+   justify-content: safe center keeps the centring without the trap that comes
+   with it: an overflowing centred flex line overflows in BOTH directions, so
+   the START edge goes out of reach and scrolling cannot bring it back. `safe`
+   degrades to flex-start at exactly that point and at no other. */
+.bid-wrap, .trick-area, .interstitial {
+  min-height: 0;
+  overflow-y: auto;
+  justify-content: safe center;
+}
 
 /* --- the scoreboard ----------------------------------------------------- */
 /* A row, so the help button can sit opposite the title. `align-items:

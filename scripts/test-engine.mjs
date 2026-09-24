@@ -95,19 +95,319 @@ import {
   PEER_PREFIX, peerIdForCode, codeFromPeerId,
   CONN_ID_PREFIX, HOST_ID, playerIdForConn, connIdForPlayer,
   WIRE, joinFrame, readJoinFrame, stateFrameFor, readStateFrame,
-  rejectFrame, readRejectFrame,
+  rejectFrame, readRejectFrame, replacedFrame, isReplacedFrame,
   peerAvailable, isFatalPeerError, describePeerError, createHost, joinHost,
 } from '../js/net.js';
 import { installPeerJS, installStorage, installClock, withoutPeerJS } from './peershim.mjs';
-// Node's own, for the last section only. index.html, sw.js and the manifest
+// Node's own, mostly for the last section. index.html, sw.js and the manifest
 // are not modules and cannot be imported, so they are read off disk as text —
 // and sw.js is then EXECUTED against a fake Cache API, because a list of files
 // checked by eye is not the same as a worker that caches them.
-import { readFileSync, readdirSync } from 'node:fs';
+// writeFileSync is here for ONE caller: --write-stamp, below. A test runner
+// that can write to the repository is a thing to be suspicious of, so the
+// single write it performs is fenced into that mode and that mode exits before
+// a single assertion runs.
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // For SHELL_STAMP only. sw.js names its cache after a fingerprint of the files
 // it precaches, and the only way to check a fingerprint is to recompute it.
 import { createHash } from 'node:crypto';
+
+// Up here rather than beside the shell section that was its only caller,
+// because the UI section now reads js/ui.js as text too. See SCREENS below.
+const REPO = fileURLToPath(new URL('../', import.meta.url));
+const readRepo = (rel) => readFileSync(REPO + rel, 'utf8');
+
+/**
+ * Every flat-bodied rule in a stylesheet, as { sel, body, at }.
+ *
+ * `at` is the at-rule prelude the rule sits inside — '' for a rule that always
+ * applies, '@media (prefers-reduced-motion: reduce)' for one that does not.
+ * Recording it is not decoration: the FIRST version of this walked the braces
+ * with one regex, which flattens the nesting away, and the hand-geometry
+ * section below then read `transform` off `.card-btn.sel .card` and got the
+ * `none` from inside the reduced-motion block instead of the translateY from
+ * the rule that normally applies. A parser that cannot tell "always" from
+ * "sometimes" reports the last thing it saw and calls it the value.
+ *
+ * Comments are stripped first: this project's stylesheet quotes selectors at
+ * length in its prose, and a parser that reads the prose finds rules that do
+ * not exist.
+ *
+ * Up here rather than inside the seat-state section that first needed it,
+ * because the hand-geometry section needs the same parse. A stylesheet parser
+ * is exactly the kind of thing that gets copied into the second caller and
+ * then improved in only one of the two.
+ */
+function cssRules(rel) {
+  const src = readRepo(rel).replace(/\/\*[\s\S]*?\*\//g, '');
+  const out = [];
+  const stack = [];
+  const brace = /[{}]/g;
+  let from = 0, m;
+  while ((m = brace.exec(src))) {
+    const text = src.slice(from, m.index);
+    from = m.index + 1;
+    if (m[0] === '{') {
+      // Whatever we were inside has a nested block, so it is a wrapper and not
+      // a rule of its own.
+      if (stack.length) stack[stack.length - 1].wrapper = true;
+      stack.push({ head: text.trim(), wrapper: false });
+    } else {
+      const frame = stack.pop();
+      if (!frame) continue; // stray '}': malformed CSS, and not this file's job
+      if (!frame.wrapper) out.push({ sel: frame.head, body: text, at: stack.map((f) => f.head).join(' ') });
+    }
+  }
+  return out;
+}
+
+/**
+ * The last value `prop` is given by the rule whose selector is exactly `sel`.
+ * Last, not first, because that is what the cascade does with two declarations
+ * of the same property at the same specificity — reading the first would make
+ * this disagree with the browser precisely when someone has overridden
+ * something, which is when it matters.
+ *
+ * Conditional rules are skipped. A declaration inside @media is the value for
+ * the readers that match the query, not the value; callers here are asking
+ * what the layout is, and the answer has to be the one that does not depend on
+ * who is looking.
+ */
+function cssDecl(rules, sel, prop) {
+  let found = null;
+  for (const r of rules) {
+    if (r.sel !== sel || r.at) continue;
+    for (const d of r.body.split(';')) {
+      const m = d.match(/^\s*([\w-]+)\s*:\s*(.+?)\s*$/);
+      if (m && m[1] === prop) found = m[2];
+    }
+  }
+  return found;
+}
+
+/**
+ * sw.js's three constants, obtained by EXECUTING the file rather than by
+ * regex — a regex over source is a parser that does not report syntax errors.
+ *
+ * Up here beside readRepo rather than down in the shell section that used to
+ * be its only caller, because --write-stamp needs it too. Two copies of "how
+ * you get SHELL out of sw.js" is the same shape of defect as two copies of the
+ * seal: they agree until one is updated and the other is not.
+ *
+ * Returns the parse error rather than asserting on it. One caller counts a
+ * failure and carries on with empty constants; the other has to refuse to
+ * write anything at all. Neither of those decisions belongs in here.
+ */
+function loadSwConsts() {
+  const src = readRepo('sw.js');
+  let factory = null;
+  try {
+    // eslint-disable-next-line no-new-func
+    factory = new Function(
+      'self', 'caches', 'fetch', 'Response',
+      src + '\n; return { CACHE_NAME, SHELL, SHELL_STAMP };'
+    );
+  } catch (e) {
+    return { src, error: e, CACHE_NAME: '', SHELL: [], SHELL_STAMP: '' };
+  }
+  // A throwaway instantiation purely to read the constants. The handlers it
+  // registers are dropped; the real drive happens in the shell section.
+  const consts = factory(
+    { addEventListener() {}, location: { origin: 'https://x.test' }, clients: {} },
+    {}, () => {}, class {}
+  );
+  return { src, error: null, ...consts };
+}
+
+/**
+ * THE FINGERPRINT, in one place. sw.js names its cache after a hash of the
+ * files it precaches, so a stale name is a returning visitor pinned to a build
+ * that was fixed weeks ago — and the only way to check a fingerprint is to
+ * recompute it.
+ *
+ * This function is the ONLY implementation of that hash in the repository, and
+ * that is deliberate rather than tidy. The checker below and the --write-stamp
+ * writer both call it, and had the writer been given its own copy the two
+ * would have agreed right up until one of them learned something the other did
+ * not — a new binary extension, a different separator — at which point the
+ * writer would confidently paste a value the checker rejects. That is the same
+ * defect as the two sealers in #26 and the hand-written handler lists in #27,
+ * and the fix is the same one: derive it once, call it twice.
+ *
+ * Returns the counts alongside the digest because a hash of nothing is still a
+ * hash. Both callers need to know the sweep found something before they
+ * believe the twelve characters it produced.
+ */
+function shellStampOf(SHELL) {
+  // './' and './index.html' are the same bytes from any static host; hashing
+  // both would count the page twice and, worse, would make the stamp depend on
+  // a listing decision rather than on content. Mapped and de-duplicated.
+  // Sorted, so the order of the SHELL array — which is written for humans, in
+  // dependency order — cannot change the answer.
+  const paths = [...new Set(SHELL.map((p) => (p === './' ? './index.html' : p)))].sort();
+
+  const BINARY = /\.(png|jpg|jpeg|ico|woff2?)$/;
+  const h = createHash('sha256');
+  let hashed = 0;
+  let unreadable = 0;
+  for (const p of paths) {
+    let bytes;
+    try { bytes = readFileSync(REPO + p.slice(2)); } catch (_) { unreadable++; continue; }
+    // LINE ENDINGS NORMALISED for text. A checkout on Windows and a checkout
+    // on Linux hold different bytes for the same commit, and without this the
+    // suite would fail on one of them for a reason that has nothing to do with
+    // the app. Binaries are hashed as-is — there are no line endings in a PNG,
+    // only pixels that happen to be 0x0D.
+    if (!BINARY.test(p)) bytes = Buffer.from(bytes.toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
+    // The path goes into the hash as well as the contents, with a separator, so
+    // that renaming a file changes the stamp even when its bytes do not — and
+    // so that two adjacent files cannot be concatenated into the same digest as
+    // one longer file.
+    h.update(p); h.update('\0'); h.update(bytes); h.update('\0');
+    hashed++;
+  }
+  return { stamp: h.digest('hex').slice(0, 12), hashed, unreadable };
+}
+
+/** The one line --write-stamp is allowed to touch. */
+const STAMP_ANCHOR = /^const SHELL_STAMP = '([0-9a-f]{12})';$/m;
+
+/**
+ * WHAT --write-stamp WOULD DO TO A GIVEN sw.js, decided without touching the
+ * disk. Returns `{ refuse, stamp, hashed, unreadable, was, next }`, where
+ * `refuse` is a reason string or null, and `next` is the complete new file
+ * text or null if it refused.
+ *
+ * SPLIT OUT FROM THE WRITER SO THE SUITE CAN DRIVE IT. The guards below are
+ * the entire reason a test runner is trusted with a write, and as long as they
+ * lived inside `if (process.argv.includes(...))` nothing could reach them: the
+ * suite never takes that branch, so deleting every one of them would have left
+ * 121,000 assertions green and a writer that pastes a hash of an empty sweep
+ * over the deploy blocker it was meant to fix. Untested safety code is
+ * decoration, and it is the most dangerous kind because of how it reads.
+ *
+ * Pure, and takes the parsed file rather than reading it, so the suite can
+ * hand it a two-anchor sw.js or a SHELL full of paths that do not exist —
+ * inputs that cannot be produced any other way without damaging the working
+ * tree to test the thing that protects it.
+ */
+function planStampWrite(sw) {
+  const refuse = (why) => ({ refuse: why, stamp: null, hashed: 0, unreadable: 0, was: null, next: null });
+
+  if (sw.error) return refuse(`sw.js does not parse — ${sw.error.message}`);
+  if (!Array.isArray(sw.SHELL) || sw.SHELL.length === 0) return refuse('sw.js exports no usable SHELL');
+
+  const { stamp, hashed, unreadable } = shellStampOf(sw.SHELL);
+  // THE SAME PAIRING THE CHECKER USES, for a sharper reason. A hash over a
+  // sweep that found nothing is a well-formed answer to the wrong question;
+  // downstream of the checker that is a confusing failure, but downstream of
+  // the writer it is a wrong value written into the file — and once written,
+  // the checker agrees with it. The check and the fix cannot both be fooled by
+  // the same bad input, so the fix has to be the more suspicious of the two.
+  if (unreadable > 0) return refuse(`${unreadable} file(s) in SHELL could not be read off disk`);
+  if (hashed < 20) return refuse(`the sweep covered only ${hashed} files — that is not the shell`);
+
+  // The anchor has to be unique. A second occurrence means the file is not
+  // shaped the way this assumes, and the honest response is to stop rather
+  // than to edit whichever one happens to come first.
+  const hits = sw.src.match(new RegExp(STAMP_ANCHOR.source, 'gm')) || [];
+  if (hits.length !== 1) return refuse(`found ${hits.length} SHELL_STAMP declarations in sw.js, expected exactly 1`);
+
+  return {
+    refuse: null,
+    stamp,
+    hashed,
+    unreadable,
+    was: sw.src.match(STAMP_ANCHOR)[1],
+    next: sw.src.replace(STAMP_ANCHOR, `const SHELL_STAMP = '${stamp}';`),
+  };
+}
+
+/**
+ * `node scripts/test-engine.mjs --write-stamp` — the one mode in which the
+ * test runner writes to the repository.
+ *
+ * WHY THIS EXISTS. Every legitimate edit to a shell file makes the suite red
+ * until somebody pastes twelve hex characters into sw.js. That is correct —
+ * the stamp really is stale — but it costs a round trip on every change, and a
+ * check that is red for a known and mechanical reason is a check people learn
+ * to run last. Printing the answer was the first half of that fix; applying it
+ * is the second.
+ *
+ * WHY IT IS FENCED THIS TIGHTLY. A test runner that can edit the code it
+ * grades is exactly the tool you would build if you wanted a green suite that
+ * means nothing, so the blast radius is cut down to the smallest thing that
+ * still does the job:
+ *
+ *   - it runs HERE, above SCREENS and above every assertion, and exits. There
+ *     is no path on which a run both writes a stamp and reports a pass count,
+ *     so `npm test` cannot quietly repair what it was meant to catch. That the
+ *     test script does not pass the flag is asserted in the shell section.
+ *   - it writes ONE line, and only where planStampWrite() above allows it.
+ *   - it reads the file back and re-parses before claiming success.
+ *
+ * Note it is safe for this to write sw.js at all only because sw.js is not in
+ * SHELL: the file holding the hash is not among the files hashed, so writing
+ * it does not move the target. That is asserted in the shell section too.
+ */
+if (process.argv.includes('--write-stamp')) {
+  const plan = planStampWrite(loadSwConsts());
+
+  if (plan.refuse) {
+    console.error(`--write-stamp refused: ${plan.refuse}`);
+    console.error('sw.js is unchanged. Fix the above and run it again.');
+    process.exit(1);
+  }
+
+  if (plan.was === plan.stamp) {
+    console.log(`shell stamp already current: ${plan.stamp} over ${plan.hashed} files. Nothing written.`);
+    process.exit(0);
+  }
+
+  writeFileSync(REPO + 'sw.js', plan.next, 'utf8');
+
+  // READ IT BACK. The difference between "wrote the file" and "the file now
+  // says what I meant" is the whole reason this mode is allowed to exist, and
+  // re-parsing is the only way to learn that the replacement landed inside a
+  // string literal or broke the syntax on the way past.
+  const after = loadSwConsts();
+  if (after.error) {
+    console.error(`--write-stamp: sw.js no longer parses after the write — ${after.error.message}`);
+    process.exit(1);
+  }
+  if (after.SHELL_STAMP !== plan.stamp) {
+    console.error(`--write-stamp: sw.js still reads ${after.SHELL_STAMP} after the write`);
+    process.exit(1);
+  }
+
+  console.log(`shell stamp: ${plan.was} -> ${plan.stamp}  (over ${plan.hashed} files)`);
+  console.log(`cache name:  ${after.CACHE_NAME}`);
+  console.log('Review the diff, then run the suite.');
+  process.exit(0);
+}
+
+/**
+ * EVERY SCREEN render() DISPATCHES ON, read out of js/ui.js rather than typed
+ * here.
+ *
+ * Three separate sweeps below used to carry their own hand-written copy of
+ * this list — the render-everything sweep, the help-button sweep and the
+ * drawer sweep. A fourth screen landing means remembering all three, and the
+ * cost of forgetting is not a red suite: it is a screen that is never drawn
+ * by any test, which is the most comfortable place in the codebase for a
+ * crash to live. 'nonsense' is appended on purpose and is not in the file: a
+ * screen name nothing should ever set must fall through to home rather than
+ * to a blank page, and that is only asserted if something asks for one.
+ */
+const SCREENS = (() => {
+  const src = readRepo('js/ui.js');
+  const body = src.slice(src.indexOf('switch (app.screen)'));
+  const found = [...body.slice(0, body.indexOf('\n  }')).matchAll(/case '([a-z]+)':/g)]
+    .map((m) => m[1]);
+  if (found.length < 5) throw new Error(`SCREENS found only ${found.length} cases in ui.js`);
+  return [...found, 'nonsense'];
+})();
 
 let passed = 0, failed = 0;
 function ok(cond, msg) {
@@ -1171,6 +1471,72 @@ function playMatchUntil(opts, predicate) {
   return found;
 }
 
+// THREE CONFIGS THAT DISAGREE ON EVERY AXIS, so a sweep over them covers each
+// scoring mode, each trump method and each round shape exactly once, with the
+// hook both ways. Small hand sizes on purpose: the point is to reach round
+// twelve and a long history quickly, not to play realistic hands.
+//
+// Declared up here rather than beside the UI sweeps that were its first
+// caller, because the engine sections below now use it too and a const above
+// its declaration is a TDZ crash.
+const UI_CONFIGS = [
+  { scoring: 'kachuful', trumpMethod: 'rotation', shape: 'descending', hook: true, maxHand: 4 },
+  { scoring: 'square', trumpMethod: 'turnup', shape: 'downup', hook: false, maxHand: 3 },
+  { scoring: 'standard', trumpMethod: 'rotation-nt', shape: 'ascending', hook: true, maxHand: 3 },
+];
+
+// ---------------------------------------------------------------------------
+// TWO WAYS OF LOOKING AT AN OBJECT GRAPH, shared by the two sections that ask
+// about the engine's boundaries: what can be reached from here, and what
+// happens if you write to it. Up here rather than in the first section that
+// needed them, because the second one needs the same pair and two copies of
+// a probe drift apart exactly when one of them is quietly wrong.
+// ---------------------------------------------------------------------------
+
+/** Everything reachable from a value, following arrays and plain objects.
+ *  Structural rather than a list of field names for the usual reason: a field
+ *  added later is a field a hand-written list does not have, and the bugs
+ *  these sections close ARE fields that were added and not covered. */
+function reachable(v, out = [], seen = new Set()) {
+  if (!v || typeof v !== 'object' || seen.has(v)) return out;
+  seen.add(v);
+  out.push(v);
+  for (const child of Array.isArray(v) ? v : Object.values(v)) reachable(child, out, seen);
+  return out;
+}
+
+/**
+ * Does writing to this actually fail? Object.isFrozen is the claim; this is
+ * the behaviour. They can disagree — a frozen object still accepts a write
+ * silently in sloppy mode — and the behaviour is what a consumer meets. This
+ * file is an ES module and therefore strict, which is the only reason the
+ * throw can be relied on; there is an assertion pinning that too.
+ *
+ * IT MUST LEAVE NO TRACE, and on arrays that takes more than putting the old
+ * value back. Writing index 0 of an EMPTY array moves `length` to 1, and
+ * `delete` does not move it back — so the probe would hand the next sweep a
+ * one-element array holding a hole, and the crash lands in the probe rather
+ * than at the assertion, with no name on it. That is not hypothetical: it is
+ * what this helper did the first time an engine array was both reachable and
+ * writable, which is precisely the case it exists to report. A measurement
+ * that damages what it measures reports the damage instead of the finding.
+ */
+function rejectsWrites(o) {
+  const key = Array.isArray(o) ? 0 : '__probe__';
+  const len = Array.isArray(o) ? o.length : -1;
+  const had = Object.prototype.hasOwnProperty.call(o, key);
+  const was = o[key];
+  try {
+    o[key] = '__mutated__';
+    if (o[key] === '__mutated__') {
+      if (had) o[key] = was; else delete o[key];
+      if (len >= 0) o.length = len;
+      return false;
+    }
+    return true;
+  } catch (_) { return true; }
+}
+
 function playMatch({
   config = {}, players = 4, strategy = 'random', shuffleSeed = 1, pickerSeed = 1,
   onState = null, names = null,
@@ -1400,6 +1766,484 @@ for (const trumpMethod of TRUMP_METHODS) {
   });
   eq(ntNulls, 0, 'under the No Trump rotation the trump is never "not yet turned"');
   ok(ntSentinels > 0, 'and the No Trump rounds report the sentinel, which is a different thing');
+}
+
+// ===========================================================================
+section('The engine: the public view cannot move the engine');
+// ===========================================================================
+
+// THE OTHER HALF OF THE PRIVACY BOUNDARY. The section above proves nothing
+// secret gets OUT through publicState(). This proves nothing gets back IN —
+// that a consumer holding a public state cannot reach through it and change
+// the engine that produced it.
+//
+// It is the same boundary and it fails in the opposite direction, which is
+// why it was missed: every assertion above reads the view and none of them
+// writes to it. `pub.history[0].totals.sort()` — one line, in a scoreboard,
+// the single most obvious thing anybody would write — reordered the engine's
+// own frozen record of a finished round, and `pub.log.at(-1).text = x`
+// rewrote a line in the engine's narration. Both of those were reachable and
+// neither was caught, because the arrays hanging off a frozen record are not
+// themselves frozen and Object.freeze does not say so.
+//
+// This matters on the HOST and essentially nowhere else, which is the reason
+// it is easy to talk yourself out of. A client's public state has been
+// through JSON and is a deep copy by construction, so a client that mutates
+// it is only ever wrong about itself. The host runs js/ui.js and js/bot.js
+// directly against the object the engine handed back — so the one peer where
+// this is reachable is the one holding the authoritative game.
+//
+// Written as a sweep over every state of several whole matches rather than a
+// fixture, because the interesting records are the ones built in round twelve
+// under a config nobody used when writing this.
+{
+  // reachable() and rejectsWrites() are declared beside playMatchUntil — the
+  // section below this one asks the same two questions of restore().
+
+  let states = 0, liveRecords = 0, liveArrays = 0, liveLines = 0;
+  let recordsSeen = 0, arraysSeen = 0, linesSeen = 0;
+  let sharedRecords = 0, sharedLines = 0, writableReached = 0;
+
+  for (const cfg of UI_CONFIGS) {
+    playMatch({
+      config: cfg, players: 5, strategy: 'random', shuffleSeed: 23,
+      onState: (g) => {
+        states++;
+        const pub = g.publicState();
+
+        for (const rec of pub.history) {
+          recordsSeen++;
+          if (!rejectsWrites(rec)) liveRecords++;
+          // The point of the whole item: the arrays INSIDE the frozen record.
+          for (const v of Object.values(rec)) {
+            if (!Array.isArray(v)) continue;
+            arraysSeen++;
+            if (!rejectsWrites(v)) liveArrays++;
+          }
+        }
+        for (const line of pub.log) {
+          linesSeen++;
+          if (!rejectsWrites(line)) liveLines++;
+        }
+
+        // Shared by reference, and that is the DESIGN rather than an
+        // oversight — freezing is what makes sharing safe, and asserting the
+        // sharing keeps the next reader from "fixing" it into a deep copy and
+        // paying for it 900 times a match. If these ever stop matching,
+        // somebody changed the strategy and should say so here.
+        if (pub.history.length && pub.history[0] === g.history[0]) sharedRecords++;
+        if (pub.log.length && pub.log[0] === g.log[g.log.length - pub.log.length]) sharedLines++;
+
+        // The sweeping version of the two loops above: ANYTHING writable that
+        // is also reachable from the engine. Copied nodes are exempt — a
+        // consumer sorting pub.seats is sorting its own array — so this asks
+        // only about nodes the engine can still see.
+        const mine = new Set(reachable(g.history).concat(reachable(g.log)));
+        for (const node of reachable(pub)) {
+          if (mine.has(node) && !rejectsWrites(node)) writableReached++;
+        }
+      },
+    });
+  }
+
+  ok(states > 150, `the sweep covered ${states} states across ${UI_CONFIGS.length} configs`);
+  ok(recordsSeen > 100, `and reached ${recordsSeen} history records`);
+  ok(arraysSeen > 400, `and ${arraysSeen} arrays hanging off them`);
+  ok(linesSeen > 1000, `and ${linesSeen} log lines`);
+
+  eq(liveRecords, 0, 'no history record in the public state accepts a write');
+  eq(liveArrays, 0,
+    'and neither does any array inside one — the freeze goes all the way down, not just to the record');
+  eq(liveLines, 0, 'no log line in the public state accepts a write');
+  eq(writableReached, 0,
+    'nothing the engine can still see is writable through the public state, by any path');
+
+  ok(sharedRecords > 100, 'the records really are shared, not copied — the freeze is what makes that safe');
+  ok(sharedLines > 100, 'and so are the log lines');
+
+  // The arrays THEMSELVES are still copies, and must be: a frozen record does
+  // not stop `pub.log.push(...)` reaching the engine's log, only the slice
+  // does. Freezing the entries and slicing the array are two mechanisms and
+  // this is the one the freeze does not cover.
+  {
+    const g = playMatchUntil({ config: UI_CONFIGS[0], players: 4 }, (e) => e.history.length >= 2);
+    const pub = g.publicState();
+    ok(pub.history !== g.history, 'the history ARRAY is a copy, so a consumer cannot append a round');
+    ok(pub.log !== g.log, 'and so is the log array');
+    const rounds = g.history.length, lines = g.log.length;
+    pub.history.push({ roundIndex: 999 });
+    pub.log.push({ text: 'injected', kind: 'system' });
+    eq(g.history.length, rounds, 'pushing a fabricated round onto the view does not reach the engine');
+    eq(g.log.length, lines, 'nor does pushing a fabricated line');
+
+    // And the sharpest version of the whole item, stated as the line somebody
+    // would actually write. sort() mutates in place, so on a frozen array it
+    // throws rather than quietly reordering a finished round.
+    let threw = false;
+    try { pub.history[0].totals.sort((a, b) => b - a); } catch (_) { threw = true; }
+    ok(threw, 'sorting a score row through the public view throws instead of reordering the engine');
+    let threwLine = false;
+    try { pub.log[0].text = 'rewritten'; } catch (_) { threwLine = true; }
+    ok(threwLine, 'and rewriting a log line throws instead of editing the engine narration');
+  }
+
+  // --- config: a LIVE reference, safe for a reason owned by another file ---
+  //
+  // pub.config === engine.config, uncopied and unfrozen by state.js. It is
+  // safe only because normalizeConfig() freezes it and every value in it is a
+  // primitive, so the shallow freeze happens to be a deep one. That is a
+  // guarantee js/rules.js provides and js/state.js silently consumes, with a
+  // file boundary in between and nothing previously stretched across it —
+  // delete the freeze in rules.js and the suite went green while the privacy
+  // boundary grew a hole.
+  {
+    const g = playMatchUntil({ config: UI_CONFIGS[1], players: 4 }, (e) => e.history.length >= 1);
+    const pub = g.publicState();
+    ok(pub.config === g.config, 'publicState hands out the config by reference, not as a copy');
+    ok(Object.isFrozen(pub.config), 'which is only safe because normalizeConfig() froze it');
+    const deep = Object.values(pub.config).every((v) => Object(v) !== v);
+    ok(deep, 'and because every value in it is a primitive, so there is no second level to freeze');
+    ok(rejectsWrites(pub.config), 'so a consumer writing to it fails rather than reconfiguring the match');
+
+    // Derived, not restated: whatever normalizeConfig returns for any input
+    // must have both properties, not just the one default config happens to.
+    let unfrozen = 0, nested = 0;
+    for (const raw of [undefined, null, {}, { hook: false }, { maxHand: 99 },
+      { scoring: 'square', trumpMethod: 'turnup', shape: 'downup' },
+      { scoring: 'nonsense', maxHand: 'x' }, { extra: [1, 2, 3] }]) {
+      const c = normalizeConfig(raw);
+      if (!Object.isFrozen(c)) unfrozen++;
+      if (!Object.values(c).every((v) => Object(v) !== v)) nested++;
+    }
+    eq(unfrozen, 0, 'normalizeConfig freezes whatever it is given, not just the default');
+    eq(nested, 0, 'and never returns a value with a second level for the freeze to miss');
+  }
+
+  // --- and after a reload, which is where a write-site freeze can lapse ----
+  //
+  // JSON has no idea what a frozen object is. A snapshot round-trips to plain
+  // objects and plain arrays, so an engine restored from one would hand out
+  // thawed records unless restore() re-freezes — and that is the worse half
+  // to lose, because resume is exactly when history is longest.
+  {
+    const g = playMatchUntil({ config: UI_CONFIGS[2], players: 4 }, (e) => e.history.length >= 3);
+    const snap = JSON.parse(JSON.stringify(g.serialize()));
+    ok(!Object.isFrozen(snap.history[0]),
+      'a snapshot through JSON really is thawed — otherwise this proves nothing');
+
+    const back = new GameEngine();
+    const r = back.restore(snap);
+    ok(r.ok, 'the snapshot restores');
+    ok(back.history.length >= 3, `and brought ${back.history.length} rounds with it`);
+
+    const pub = back.publicState();
+    let thawed = 0;
+    for (const rec of pub.history) {
+      if (!rejectsWrites(rec)) thawed++;
+      for (const v of Object.values(rec)) if (Array.isArray(v) && !rejectsWrites(v)) thawed++;
+    }
+    for (const line of pub.log) if (!rejectsWrites(line)) thawed++;
+    eq(thawed, 0, 'a RESTORED engine hands out the same sealed records a fresh one does');
+
+    // Freezing must not have eaten the contents on the way through.
+    same(pub.history.map((h) => h.totals.join(',')), g.history.map((h) => h.totals.join(',')),
+      'and the scoreboard survived the round trip unchanged');
+    same(pub.log.map((l) => l.text), g.publicState().log.map((l) => l.text),
+      'and so did the narration');
+
+    // freezeRound COPIES, so history stops aliasing the snapshot. A side
+    // effect of freezing rather than the goal — and the reason to pin it is
+    // that the other twelve fields restore() assigns are still aliased, which
+    // is a separate audit entry. Two of fourteen is not "restore is safe".
+    ok(back.history[0] !== snap.history[0],
+      'restoring copies the history records rather than adopting the snapshot\'s');
+    ok(back.log[0] !== snap.log[0], 'and the log lines too');
+  }
+
+  // A frozen write only throws in strict mode, and the whole argument for
+  // freezing over copying is that the mistake is LOUD. ES modules are always
+  // strict, so this holds for every file in js/ — but it is an assumption the
+  // reasoning rests on rather than something obvious, so it gets a line.
+  {
+    let threw = false;
+    try { Object.freeze({ a: 1 }).a = 2; } catch (_) { threw = true; }
+    ok(threw, 'this file is strict, so a write to a frozen object throws — which is why freezing is loud');
+  }
+}
+
+// ===========================================================================
+section('The engine: a restored engine owns what it was given');
+// ===========================================================================
+
+// THE THIRD DIRECTION THE SAME BOUNDARY FAILS IN. publicState() is the view
+// going out and restore() is the state coming in, and the mistake is the
+// same one: a function that looks like it copies because it says `arr(...)`
+// or `.slice()` somewhere nearby, and does not.
+//
+// restore() was scrupulous about TYPE — every field arrives through arr() or
+// Number() or ?? so that a truncated localStorage write gives a lobby rather
+// than a throw — and silent about OWNERSHIP. It adopted the caller's arrays:
+// plan, totals, stock, bids, bidOrder, tricksWon, each hand, the plays of
+// each finished trick, and the whole lastTrick record. Nine fields, all of
+// them mutated in place by the engine all match long.
+//
+// WHY IT NEVER BIT, which is the only interesting part: the one shipped
+// caller is js/main.js, and the snapshot it passes came from JSON.parse and
+// is dropped on the next line. Nobody else holds it, so nobody notices the
+// engine writing into it. The guarantee was real and it lived in a different
+// file, in a line of util.js nobody would think to protect. That is the same
+// shape as the config case above, and the answer is the same: assert it here
+// so it stops depending on a caller's habits.
+//
+// Two engines from one snapshot is where it stops being theoretical. They
+// share a `totals`, and the second match scores into the first.
+{
+  // --- (a) a snapshot shares nothing WRITABLE with the engine ---------------
+  //
+  // Not "shares nothing" — serialize() deliberately passes the frozen history
+  // records and log lines straight through, because freezing is what makes
+  // sharing safe and copying them again would be 900 copies a match for
+  // nothing. So the property is the one #21 settled on: whatever is shared is
+  // frozen. lastTrick was the single field that was neither.
+  //
+  // --- (b) an engine restored from it shares NOTHING with it ---------------
+  //
+  // Stricter than (a) on purpose. A snapshot is somebody else's object and
+  // the engine is about to spend nineteen rounds writing to its own fields,
+  // so the right relationship is no relationship: freezeRound copies the
+  // records rather than reusing the frozen ones, so even the safe-to-share
+  // nodes come out separate.
+  let states = 0, shared = 0, sharedWritable = 0, overlap = 0;
+  const writableKinds = new Set(), overlapKinds = new Set();
+
+  // Name the offending node in the failure message. A count tells you the
+  // boundary leaks; this tells you which field, which is the difference
+  // between a diagnosis and a starting point.
+  const label = (root, node) => {
+    for (const [k, v] of Object.entries(root)) {
+      if (v === node) return k;
+      if (v && typeof v === 'object' && reachable(v).includes(node)) return `${k}[...]`;
+    }
+    return '?';
+  };
+
+  for (const cfg of UI_CONFIGS) {
+    playMatch({
+      config: cfg, players: 5, strategy: 'random', shuffleSeed: 37,
+      onState: (g) => {
+        states++;
+        const snap = g.serialize();
+
+        const mine = new Set(reachable(g));
+        for (const node of reachable(snap)) {
+          if (!mine.has(node)) continue;
+          shared++;
+          if (!rejectsWrites(node)) { sharedWritable++; writableKinds.add(label(snap, node)); }
+        }
+
+        const back = new GameEngine();
+        back.restore(snap);
+        const theirs = new Set(reachable(snap));
+        for (const node of reachable(back)) {
+          if (theirs.has(node)) { overlap++; overlapKinds.add(label(back, node)); }
+        }
+      },
+    });
+  }
+
+  ok(states > 150, `the sweep covered ${states} states across ${UI_CONFIGS.length} configs`);
+  ok(shared > 100, `and ${shared} nodes really are shared between engine and snapshot`);
+  eq(sharedWritable, 0,
+    `everything a snapshot shares with its engine is frozen — writable: [${[...writableKinds].join(', ')}]`);
+  eq(overlap, 0,
+    `a restored engine shares no object at all with the snapshot — shared: [${[...overlapKinds].join(', ')}]`);
+
+  // --- (c) and what that is FOR: the snapshot does not drift forward -------
+  //
+  // The two assertions above are about identity; these two are about what
+  // identity costs. Stated as the thing that actually goes wrong, so the
+  // failure reads as a bug report rather than as a broken invariant.
+  {
+    const g = playMatchUntil(
+      { config: UI_CONFIGS[0], players: 4, shuffleSeed: 5 },
+      (e) => e.phase === PHASES.BIDDING && e.history.length >= 1,
+    );
+    const snap = g.serialize();
+    const before = JSON.stringify(snap);
+
+    const back = new GameEngine();
+    back.restore(snap);
+    const seat = back.turnSeat;
+    // The first bid the restored engine itself says is legal — asking it
+    // rather than picking a number, because under the hook the dealer has one
+    // forbidden value and a hard-coded 0 would fail for a reason that has
+    // nothing to do with what this section is testing.
+    const choice = back.bidOptionsFor(seat).find((o) => o.legal);
+    const r = back.placeBid(back.seats[seat].id, choice.bid, 1000);
+    ok(r.ok, `a bid lands on the restored engine (${r.error || 'ok'})`);
+    eq(back.bids[seat], choice.bid, 'and is recorded in its bids');
+
+    eq(JSON.stringify(snap), before,
+      'bidding on a restored engine does not write the bid into the snapshot it came from');
+    eq(g.bids[seat], null,
+      'and the engine the snapshot was taken from is still waiting for that seat to bid');
+  }
+
+  {
+    // The same thing one level deeper: playCard splices the seat's HAND, so
+    // this is the inner array rather than the outer one. With no cards on the
+    // table there is no suit to follow, so any card in hand is legal and the
+    // test does not have to know the rules to pick one.
+    const g = playMatchUntil(
+      { config: UI_CONFIGS[2], players: 4, shuffleSeed: 9 },
+      (e) => e.phase === PHASES.PLAY && e.plays.length === 0 && e.sweepAt === null,
+    );
+    const snap = g.serialize();
+    const before = JSON.stringify(snap);
+
+    const back = new GameEngine();
+    back.restore(snap);
+    const seat = back.turnSeat;
+    const held = back.hands[seat].length;
+    const r = back.playCard(back.seats[seat].id, back.hands[seat][0], 1000);
+    ok(r.ok, `a card is played on the restored engine (${r.error || 'ok'})`);
+    eq(back.hands[seat].length, held - 1, 'and leaves that hand one card shorter');
+
+    eq(JSON.stringify(snap), before,
+      'playing a card on a restored engine does not take the card out of the snapshot');
+    eq(g.hands[seat].length, held, 'nor out of the hand the original engine is still holding');
+  }
+
+  // --- (d) two engines, one snapshot ---------------------------------------
+  //
+  // The end state of the bug, and the reason this is worth a section rather
+  // than a slice: restoring twice from one object gave two engines writing
+  // into one set of arrays. Nothing in the app does this — but "nothing does
+  // this today" is a fact about main.js, not about restore().
+  {
+    const g = playMatchUntil(
+      { config: UI_CONFIGS[1], players: 4, shuffleSeed: 11 },
+      (e) => e.phase === PHASES.BIDDING && e.history.length >= 1,
+    );
+    const snap = JSON.parse(JSON.stringify(g.serialize()));
+
+    const a = new GameEngine(); a.restore(snap);
+    const b = new GameEngine(); b.restore(snap);
+    const bBefore = JSON.stringify(b.serialize());
+
+    const seat = a.turnSeat;
+    const choice = a.bidOptionsFor(seat).find((o) => o.legal);
+    ok(a.placeBid(a.seats[seat].id, choice.bid, 1000).ok,
+      'the first of two engines restored from one snapshot takes a bid');
+    eq(JSON.stringify(b.serialize()), bBefore,
+      'and the second one does not hear about it — they are two matches, not one');
+
+    let sharedAB = 0;
+    const setA = new Set(reachable(a));
+    for (const node of reachable(b)) if (setA.has(node)) sharedAB++;
+    eq(sharedAB, 0, 'the two engines share no object whatsoever');
+  }
+}
+
+// ===========================================================================
+section('The engine: a round record is sealed whatever shape it turns out to be');
+// ===========================================================================
+
+// THE PART OF THE SEAL NO REAL MATCH EXERCISES. Every field a round record has
+// ever had is a number or an array of numbers, so "frozen all the way down"
+// and "frozen one level down" are the same sentence about today's records and
+// different sentences about the function that seals them. The sweep two
+// sections up cannot tell them apart: it walks real records, and real records
+// are flat.
+//
+// That is precisely the gap that made restore() adopt the caller's arrays for
+// as long as it did — a guarantee that holds because of what the data happens
+// to look like is a property of the data, not of the code, and it lapses
+// silently the day the data changes. So this section makes the data change.
+//
+// A nested object arrives through the one door that can carry one: a SNAPSHOT
+// FROM ANOTHER BUILD. Add a field to the record in _endRound, play a match,
+// save, roll the deploy back — and the older engine restores a record with a
+// shape it has never produced. That is a real sequence, not a contrivance, and
+// it is the only way an unexpected shape reaches this code at all: restore()
+// is fed from localStorage by js/main.js and from nowhere else, never from the
+// wire. (Which is also why the recursion needs no depth limit — JSON.parse
+// cannot build a cycle, and the only person who can plant a 10,000-deep
+// snapshot in your own localStorage is you.)
+{
+  const g = playMatchUntil(
+    { config: UI_CONFIGS[0], players: 4, shuffleSeed: 5 },
+    (e) => e.history.length >= 2,
+  );
+  const snap = JSON.parse(JSON.stringify(g.serialize()));
+
+  // The three shapes a future field could plausibly take, none of which the
+  // one-level seal would have reached: a nested object, an array of objects,
+  // and an object two levels below the record.
+  const planted = {
+    byTrick: [{ winner: 0, cards: ['AS', 'KH'] }, { winner: 2, cards: ['3C'] }],
+    penalty: { kind: 'square', applied: true, detail: { seat: 1, amount: -40 } },
+  };
+  snap.history[0].byTrick = planted.byTrick;
+  snap.history[0].penalty = planted.penalty;
+
+  const back = new GameEngine();
+  back.restore(snap);
+  const rec = back.publicState().history[0];
+
+  // PAIRED POSITIVE FIRST, because every assertion below is vacuously true of
+  // a record that quietly dropped the fields. restore() does not filter the
+  // record's own keys — it seals whatever is there — and if it ever starts to,
+  // this is the line that says so rather than the suite going quietly green.
+  //
+  // EVERYTHING AFTER IT IS WRITTEN TO SURVIVE ITS FAILURE. A block whose
+  // paired positive fails and then throws on the next line reports a CRASH,
+  // and a crash says "something went wrong here" where a failure would have
+  // said which guarantee broke. The optional chaining below is not defensive
+  // coding, it is the difference between those two messages.
+  eq(rec.penalty?.detail?.amount, -40,
+    'the unknown fields survived the restore — otherwise nothing below is being tested');
+  eq(rec.byTrick?.length, 2, 'and so did the array of objects');
+
+  // 1. EVERYTHING, AT EVERY DEPTH, REJECTS A WRITE.
+  const nodes = reachable(rec);
+  const live = nodes.filter((n) => !rejectsWrites(n));
+  for (const n of live) console.error(`  ✗ FAIL: a node inside a sealed record accepts a write: ${JSON.stringify(n).slice(0, 60)}`);
+  eq(live.length, 0, 'nothing reachable inside a restored round record accepts a write, however deep');
+
+  // The depth is the whole point, so count it rather than trust it: a seal
+  // that stopped at one level would leave `detail` and the two trick objects
+  // writable, and those are the nodes this number is here to guarantee exist.
+  const deep = reachable(rec.penalty).concat(reachable(rec.byTrick));
+  ok(deep.length >= 6, `with ${deep.length} nodes below the record's own fields, not zero`);
+  ok(reachable(rec.penalty?.detail).length >= 1, 'including one two levels down');
+
+  // 2. AND NONE OF THEM IS THE CALLER'S. The seal copies; a seal that froze in
+  //    place would pass the check above while turning the snapshot read-only
+  //    under the caller still holding it.
+  const theirs = new Set(reachable(planted));
+  const shared = nodes.filter((n) => theirs.has(n));
+  eq(shared.length, 0, 'and the restored record shares no object with the snapshot it came from');
+
+  // 3. THE OTHER HALF OF "IT COPIES": the snapshot is left exactly as writable
+  //    as it was handed over. This is the guarantee that is easiest to lose by
+  //    accident — deep-freezing the argument in place satisfies 1 and 2's
+  //    spirit and breaks a caller that is still using its own object.
+  //    THE WRITE IS THE ASSERTION, so it is the write that is caught. Probing
+  //    with rejectsWrites() and then writing for real repeats the same
+  //    operation twice, and when the guarantee is broken the second one throws
+  //    — turning a named failure into a CRASH, which says "something went
+  //    wrong in this block" where the name would have said which guarantee
+  //    broke. One attempt, its outcome recorded, asserted on afterwards.
+  let stillWritable = false;
+  try {
+    planted.penalty.detail.amount = -99;
+    stillWritable = planted.penalty.detail.amount === -99;
+  } catch (_) { /* frozen under us — that IS the failure, reported on the next line */ }
+  ok(stillWritable,
+    'the caller\'s own nested object is still writable — restore() did not freeze what it was lent');
+  eq(rec.penalty?.detail?.amount, -40,
+    'and writing to it afterwards does not reach into the engine');
 }
 
 // ===========================================================================
@@ -4233,6 +5077,12 @@ function tableVisible(g) { return publiclyVisible(g); }
 section('UI: seatState, the visual language of the strip and the pad');
 // ===========================================================================
 
+// EVERY STATE THE SWEEP BELOW ACTUALLY OBSERVES, collected rather than typed.
+// The stylesheet check further down is driven by this set: a fifth state added
+// to seatState() has to be answered in css/app.css before the suite goes green
+// again, and a list written out by hand here would have to be remembered.
+const SEAT_STATES = new Set();
+
 // Exhaustive over every bid and every trick count the deck permits, plus the
 // two ways a bid can be absent. A four-way total function over two small
 // integers is exactly the sort of thing to sweep rather than sample.
@@ -4241,6 +5091,7 @@ section('UI: seatState, the visual language of the strip and the pad');
   for (const bid of [null, undefined, ...Array.from({ length: 18 }, (_, i) => i)]) {
     for (let taken = 0; taken <= 17; taken++) {
       const st = seatState(bid, taken);
+      SEAT_STATES.add(st);
       if (st === 'nobid') nobid++;
       else if (st === 'under') under++;
       else if (st === 'exact') exact++;
@@ -4277,6 +5128,674 @@ section('UI: seatState, the visual language of the strip and the pad');
   eq(seatState(0, 1), 'over', 'and a broken zero bid is over, not nobid');
 }
 
+// A NIL BID READS AS 'exact' THE INSTANT IT IS MADE, MID-BIDDING, AND THAT IS
+// THE DECISION RATHER THAN THE OVERSIGHT.
+//
+// It looks like a phase bug: the accent that elsewhere means "they have got
+// there" lights up before a card exists to have got there with. It is not. A
+// seat on 0 tricks against a bid of 0 is exact in bidding as much as in play,
+// and the nil bidder genuinely is in the position the accent describes —
+// holding what they asked for, with everything to lose.
+//
+// Pinned from a LIVE ENGINE rather than by calling seatState(0, 0) again,
+// because the claim under test is not about the function in isolation. It is
+// that the phase the engine is in does not reach the function at all, and the
+// only way to show that is to put an engine in the phase and ask.
+{
+  const g = playMatchUntil({ config: { shape: 'descending', maxHand: 4 }, players: 5 },
+    (s) => s.phase === PHASES.BIDDING && s.bids.every((b) => b === null));
+
+  const turn = g.turnSeat;
+  const nil = g.bidOptionsFor(turn).find((o) => o.legal && o.bid === 0);
+  ok(nil, 'zero is a legal opening bid, so the case this pins is reachable at all');
+  ok(g.placeBid(g.seats[turn].id, nil.bid, 1).ok, 'and the nil bid lands');
+
+  const pub = g.publicState();
+  eq(pub.phase, PHASES.BIDDING, 'the round is still being bid — nobody has played a card');
+  eq(pub.seats.filter((s) => s.tricks > 0).length, 0, 'and no seat has taken a trick');
+
+  // Exactly what playStrip() reads off the seat record, argument for argument.
+  const me = pub.seats[turn];
+  eq(seatState(me.bid, me.tricks), 'exact',
+    'a nil bid reads as exact from the moment it is made, mid-bidding, by design');
+
+  // THE SEATS THAT HAVE NOT BID YET ARE THE OTHER HALF OF THE SAME FRAME, and
+  // they are what .seat.nobid is for: at this point in the round most of the
+  // strip is em-dashes, and the one thing worth finding is the ▸.
+  const waiting = pub.seats.filter((s) => s.bid === null);
+  ok(waiting.length >= 3, `with ${waiting.length} seats still to bid in the same frame`);
+  eq(waiting.filter((s) => seatState(s.bid, s.tricks) !== 'nobid').length, 0,
+    'and every one of them is nobid, so both states are on screen at once');
+
+  // The mechanism, stated directly: no phase argument exists to pass.
+  eq(seatState.length, 2, 'seatState takes a bid and a trick count, and no phase');
+}
+
+// ===========================================================================
+section('UI: the four seat states each paint differently — ui.js <-> app.css');
+// ===========================================================================
+
+// THE STATE NAMES COME FROM THE SWEEP ABOVE, THE PAINT COMES FROM THE
+// STYLESHEET, AND NEITHER IS TYPED HERE. The bug this replaces was exactly the
+// pair going out of step: seatState() grew a fourth answer and css/app.css
+// carried a comment that said "three", so a seat that had not bid inherited
+// the resting colour by accident. The class-coverage seam further down could
+// not see it — `.nobid` did eventually get a rule, and a rule that duplicates
+// its neighbour looks identical to a rule that means something.
+//
+// So the question asked here is not "is there a rule" but "does it SAY
+// anything different from the others".
+{
+  // Selector + body for every flat-bodied rule. Shared with the hand-geometry
+  // section below — see cssRules() at the top of this file.
+  const rules = cssRules('css/app.css');
+  ok(rules.length > 100, `parsed ${rules.length} rules out of app.css, so the parser found something`);
+
+  // Declarations, normalised so that whitespace and a trailing semicolon are
+  // not differences.
+  const decls = (body) => body.split(';').map((d) => d.trim().replace(/\s+/g, ' '))
+    .filter(Boolean).sort().join('; ');
+
+  // A compound selector's class tokens — `.seat.you.exact` is {seat,you,exact}.
+  // Split on descendant/child combinators first so that `.seat.exact .seat-name`
+  // is not read as one compound carrying all three.
+  const compounds = (sel) => sel.split(',').flatMap((one) => one.trim().split(/[\s>+~]+/))
+    .filter(Boolean)
+    .map((c) => new Set([...c.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((m) => m[1])));
+
+  // What a rule paints, with the state class removed from the selector — so
+  // `.seat.under .seat-score {color: var(--text)}` and `.seat.nobid
+  // .seat-score {color: var(--muted)}` compare as the same target with
+  // different paint, which is the comparison that matters.
+  const paintFor = (state) => {
+    const out = new Set();
+    for (const { sel, body } of rules) {
+      if (!compounds(sel).some((c) => c.has('seat') && c.has(state))) continue;
+      out.add(`${sel.replace(new RegExp(`\\.${state}\\b`, 'g'), '')} => ${decls(body)}`);
+    }
+    return out;
+  };
+
+  const paint = new Map([...SEAT_STATES].map((s) => [s, paintFor(s)]));
+  eq(paint.size, 4, `every state seatState() answers was looked up: ${[...SEAT_STATES].sort().join(', ')}`);
+
+  // 1. EVERY STATE IS SPELLED OUT. An absent rule and a deliberate no-op rule
+  //    look identical in a stylesheet, and only one of them survives a tidy-up.
+  const silent = [...paint].filter(([, p]) => p.size === 0).map(([s]) => s);
+  for (const s of silent) console.error(`  ✗ FAIL: seatState() answers '${s}' and app.css has no .seat.${s} rule`);
+  eq(silent.length, 0, 'every seat state has a rule of its own in app.css');
+
+  // 2. NO TWO STATES PAINT THE SAME. This is the assertion that would have
+  //    caught the original: nobid and under both resolving to var(--text) is a
+  //    state the stylesheet acknowledges and does not distinguish, which is a
+  //    fourth state on paper and three on screen.
+  const same = [];
+  const names = [...paint.keys()].sort();
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const a = [...paint.get(names[i])].sort().join(' | ');
+      const b = [...paint.get(names[j])].sort().join(' | ');
+      if (a === b) same.push(`${names[i]}/${names[j]}`);
+    }
+  }
+  for (const p of same) console.error(`  ✗ FAIL: app.css paints ${p} identically — one of the four states is invisible`);
+  eq(same.length, 0, 'and no two of the four states are painted the same way');
+
+  // 3. THE DECISION, DERIVED RATHER THAN COPIED. "nobid" recedes to whatever
+  //    .seat-name already uses, so an unbid chip is uniformly quiet and the ▸
+  //    is the only thing competing for the eye. Read the colour off the
+  //    .seat-name rule instead of writing var(--muted) here: if the chrome
+  //    palette is retuned the two move together or this fails, which is the
+  //    point of stating it as a relationship.
+  const colourOf = (pred) => {
+    for (const { sel, body } of rules) {
+      if (!pred(sel)) continue;
+      const m = body.match(/(?:^|;)\s*color\s*:\s*([^;]+)/);
+      if (m) return m[1].trim();
+    }
+    return null;
+  };
+  const nameColour = colourOf((s) => s.trim() === '.seat-name');
+  const nobidColour = colourOf((s) => /\.seat\.nobid\b/.test(s));
+  const underColour = colourOf((s) => /\.seat\.under\b/.test(s));
+  ok(nameColour && nobidColour && underColour,
+    `all three colours were found in the stylesheet (${nameColour} / ${nobidColour} / ${underColour})`);
+  eq(nobidColour, nameColour,
+    'a seat that has not bid is the same colour as its own name — the whole chip recedes together');
+  ok(nobidColour !== underColour,
+    `and a seat that HAS bid is not (${nobidColour} vs ${underColour})`);
+
+  // 4. BID STATE AND PRESENCE USE DIFFERENT CHANNELS. .seat.gone is opacity
+  //    plus a struck-through name, and it has to be able to coexist with all
+  //    four of these — a player can walk away from the keyboard while sitting
+  //    on a made bid, and the chip must say both things at once. That only
+  //    works while the state rules stay out of the opacity channel.
+  const stateBodies = [...paint.values()].flatMap((p) => [...p]).join(' ');
+  ok(!/(^|[^-\w])opacity\s*:/.test(stateBodies),
+    'no seat-state rule touches opacity, so .seat.gone can dim any of them');
+  ok(rules.some(({ sel, body }) => /\.seat\.gone\b/.test(sel) && /opacity\s*:/.test(body)),
+    'and .seat.gone is the rule that does own opacity, so the channels really are separate');
+
+  console.log(`  seat states: ${names.map((n) => `${n}(${paint.get(n).size})`).join(' ')}`
+    + ` over ${rules.length} css rules; nobid=${nobidColour}, under=${underColour}`);
+}
+
+// ===========================================================================
+section('UI: a card in the hand is card-shaped at every legal hand size');
+// ===========================================================================
+
+// WHAT WENT WRONG, AND WHY NOTHING CAUGHT IT.
+//
+// `.hand .card` used to be `flex: 1 1 0; min-width: 0; max-width: 58px;
+// height: 78px` — width divides the row with no floor, height never moves. At
+// the default ten-card round on a 375px phone that renders a card 30.4px wide
+// and 78px tall. A playing card is about 0.70 wide-to-tall; that is 0.39. By
+// seventeen cards, the legal ceiling for three players, the card is 13.2px
+// wide and the "10" it has to print is 19.8px, so the rank hangs outside the
+// face.
+//
+// The comment over cardFace() said the sizing had been "measured" — and it
+// had, at one card and at ten. Ten was the last hand size that did not
+// visibly overflow. A measurement of the case you thought of is not a
+// measurement of the range, and the range here is 1..MAX_HAND_CEILING by 320
+// ..640px, which is small enough to sweep in full.
+//
+// So this section does not ask "is the stylesheet the way I left it". It
+// recomputes the layout from the values in the stylesheet and asks whether a
+// card comes out card-shaped and legible, for every hand a player can be
+// dealt, on every phone anyone holds. The numbers it reads are the ones the
+// browser reads; the model below was checked against a real browser at 320,
+// 360, 375, 390 and 1280px before it was written down, and agrees on the
+// per-row count at all five.
+//
+// A function, where every other section here is a bare block, for one reason:
+// this one has to be able to STOP. See the guard below.
+(() => {
+  const rules = cssRules('css/app.css');
+
+  // --- what the stylesheet actually says ----------------------------------
+  // A custom property, found by searching every rule rather than by assuming
+  // it lives on `:root` — where the palette is declared is not this section's
+  // business.
+  const cssVarOf = (name) => {
+    let found = null;
+    for (const r of rules) {
+      const m = r.body.match(new RegExp(`(?:^|;)\\s*${name}\\s*:\\s*([^;]+)`));
+      if (m) found = m[1].trim();
+    }
+    return found;
+  };
+  // Declarations are read through a var() resolver, because a value that the
+  // browser resolves and this parser does not is a value this section thinks
+  // is absent. `.card { width: var(--card-w) }` is the live case: the fanned
+  // bidding hand needs the card's width readable by the card's PARENT, which
+  // only a custom property can do, and the moment that landed every number
+  // below went null and the whole section stopped. The declaration is still
+  // there and still says 44px; only the spelling changed.
+  //
+  // One level, no fallback syntax, and a var that resolves to another var is
+  // left alone rather than chased: this is a test's CSS reader, and the day
+  // the stylesheet needs more than that is the day this should fail loudly
+  // instead of guessing. An unresolvable var() comes back as-is, px() rejects
+  // it, and the `missing` guard names it.
+  const deref = (v) => {
+    if (!v) return v;
+    const m = v.trim().match(/^var\(\s*(--[\w-]+)\s*\)$/);
+    if (!m) return v;
+    const inner = cssVarOf(m[1]);
+    return inner === null || /^var\(/.test(inner) ? v : inner;
+  };
+  const declOf = (sel, prop) => deref(cssDecl(rules, sel, prop));
+  const px = (v) => (v && /^-?[\d.]+px$/.test(v.trim()) ? parseFloat(v) : null);
+  // clamp(<min>px, <n>vw, <max>px) -> the three numbers.
+  const clampOf = (v) => {
+    const m = v && v.match(/clamp\(\s*([\d.]+)px\s*,\s*([\d.]+)vw\s*,\s*([\d.]+)px\s*\)/);
+    return m ? { min: +m[1], vw: +m[2], max: +m[3] } : null;
+  };
+
+  const baseW = px(declOf('.card', 'width'));
+  const baseH = px(declOf('.card', 'height'));
+  const handW = clampOf(declOf('.hand .card', 'width'));
+  const ratio = declOf('.hand .card', 'aspect-ratio');
+  const handGap = declOf('.hand', 'gap');
+  const rowGap = handGap && px((handGap.match(/^\s*(\S+)/) || [])[1]);
+  const colGap = clampOf(handGap);
+  const dockPad = declOf('.hand-dock', 'padding');
+  const dockPadX = dockPad && parseFloat((dockPad.match(/^\s*[\d.]+px\s+([\d.]+)px/) || [])[1]);
+  const maxw = px(cssVarOf('--maxw'));
+  const rankPx = px(declOf('.card-rank', 'font-size'));
+  const liftM = (declOf('.card-btn.sel .card', 'transform') || '').match(/translateY\(\s*-?([\d.]+)px/);
+  const lift = liftM ? +liftM[1] : null;
+
+  // Everything above is read, not typed, so the first assertion has to be that
+  // the reading worked. A parser that silently returns null turns every
+  // property below into a comparison between two nulls.
+  const read = { baseW, baseH, handW, ratio, rowGap, colGap, dockPadX, maxw, rankPx, lift };
+  const missing = Object.entries(read).filter(([, v]) => v === null || v === undefined).map(([k]) => k);
+  eq(missing.length, 0, `every value this section reasons about was found in app.css${
+    missing.length ? ` — missing: ${missing.join(', ')}` : ''}`);
+  // AND THEN STOP, which is what the function wrapper is for. Reporting the
+  // missing value is not enough on its own: everything below does arithmetic
+  // on these, `null.min` throws, and a throw here does not fail this section —
+  // it takes the process down and every section after it with it. Two of the
+  // #29 mutation rows came back CRASH rather than naming the assertion they
+  // tripped, which is how this was noticed. A suite that cannot say WHICH
+  // check caught something has stopped being a suite and become a smoke test.
+  if (missing.length) return;
+
+  // --- 1. the hand's ratio is the card's ratio, not a second opinion -------
+  //
+  // aspect-ratio duplicates .card's width and height, which is the one place
+  // in the stylesheet where the same fact is written twice. Two copies of one
+  // invariant agree until they do not, so they are compared here rather than
+  // trusted.
+  const arM = (ratio || '').match(/^\s*([\d.]+)\s*\/\s*([\d.]+)\s*$/);
+  ok(arM, `the hand's aspect-ratio is a plain w/h ratio (got ${JSON.stringify(ratio)})`);
+  if (arM) {
+    eq(`${arM[1]}/${arM[2]}`, `${baseW}/${baseH}`,
+      'and it is the SAME ratio as the base .card — retuning one moves the other or this fails');
+  }
+  const CARD_RATIO = baseW / baseH;
+
+  // --- 2. the mechanism: the row wraps, and nothing divides it ------------
+  //
+  // A floor only floors anything if the row is allowed to wrap when it is
+  // reached. Two ways this silently reverts: flex-wrap goes away, or the
+  // wrapper goes back to `flex: 1 1 0` and resumes dividing the row — at
+  // which point the floor is a min-width on an item that is being told to
+  // shrink, and the strip is back.
+  eq((declOf('.hand', 'flex-wrap') || '').trim(), 'wrap',
+    'the hand wraps, which is what makes a floor mean anything');
+  eq((declOf('.card-btn', 'flex') || '').trim(), 'none',
+    'and the tappable wrapper shrink-wraps its card instead of dividing the row');
+  eq(declOf('.hand .card', 'flex'), null,
+    'the face itself sets no flex — its width is the clamp, full stop');
+  eq((declOf('.hand .card', 'height') || '').trim(), 'auto',
+    'and its height follows the ratio rather than being pinned, which was the original bug');
+
+  // --- 3. a lifted card has somewhere to go -------------------------------
+  //
+  // .card-btn.sel raises the selected card. On one row that came out of the
+  // dock's padding; on a wrapped row it comes out of the row above, and the
+  // row-gap is the only thing between them.
+  ok(rowGap >= lift,
+    `the hand's row-gap (${rowGap}px) clears the lift .card-btn.sel applies (${lift}px)`);
+
+  // --- 4. the geometry model ----------------------------------------------
+  //
+  // Straight out of the stylesheet: the shell is capped at --maxw however wide
+  // the window is, the dock pads it, vw units still refer to the WINDOW, and
+  // the cards are laid out at a fixed width with a fixed gap.
+  const avail = (W) => Math.min(W, maxw) - 2 * dockPadX;
+  const gapAt = (W) => Math.min(Math.max(colGap.min, (colGap.vw / 100) * W), colGap.max);
+  const cardAt = (W) => Math.min(Math.max(handW.min, (handW.vw / 100) * W), handW.max);
+  const fitsOneRow = (n, w, W) => n * w + (n - 1) * gapAt(W) <= avail(W);
+  const perRow = (W) => Math.max(1, Math.floor((avail(W) + gapAt(W)) / (cardAt(W) + gapAt(W))));
+  const rowsFor = (n, W) => Math.ceil(n / perRow(W));
+
+  // --- 5. THE FLOOR IS DERIVED, NOT PREFERRED -----------------------------
+  //
+  // 38px is not a round number and must not be rounded. Seven cards is the
+  // default hand at a seven-player table — the most crowded game — and 320px
+  // is the narrowest phone. The floor is the largest value at which that hand
+  // still fits on ONE row there. One pixel more and that table wraps, the dock
+  // grows a row it has no height for, and on a 320x568 screen the cards go off
+  // the bottom of the screen. (Measured: at a 40px floor the dock's bottom
+  // edge lands at 632px on a 568px screen.)
+  //
+  // Both directions are asserted. Too big fails the first, too small fails
+  // the second, so the constant is pinned from above and below by the
+  // requirement rather than by taste.
+  const NARROWEST = 320;
+  const CROWDED_HAND = defaultMaxHand(MAX_PLAYERS);
+  eq(CROWDED_HAND, 7, 'the crowded-table hand size came from rules.js, not from this file');
+  ok(fitsOneRow(CROWDED_HAND, handW.min, NARROWEST),
+    `${CROWDED_HAND} cards at the ${handW.min}px floor fit one row on a ${NARROWEST}px phone `
+    + `(${(CROWDED_HAND * handW.min + (CROWDED_HAND - 1) * gapAt(NARROWEST)).toFixed(1)}px `
+    + `of ${avail(NARROWEST)}px)`);
+  ok(!fitsOneRow(CROWDED_HAND, handW.min + 1, NARROWEST),
+    `and the floor is the LARGEST that does — at ${handW.min + 1}px that table would wrap`);
+
+  // --- 6. the cap, against the card it sits next to -----------------------
+  //
+  // A one-card round must render one normal card, not one stretched across the
+  // dock and not one shrunk below the cards on the table. Both bounds are the
+  // base .card's own width, so this says "a hand card is in the same family as
+  // a trick card" rather than naming a number.
+  ok(handW.max >= baseW,
+    `a lone card (${handW.max}px) is at least as big as a card on the table (${baseW}px)`);
+  ok(handW.min <= baseW,
+    `and a card in the biggest hand (${handW.min}px) is never bigger than one on the table`);
+  ok(handW.max < 2 * baseW,
+    `and it is not stretched either — ${handW.max}px is under twice ${baseW}px`);
+
+  // --- 7. the sweep: every legal hand, every phone ------------------------
+  //
+  // The widths are the ones people actually hold, plus --maxw and a desktop
+  // window past it to prove the shell cap is what governs there rather than
+  // the viewport. The hand sizes are the whole legal range, which is the part
+  // the original measurement skipped.
+  //
+  // "The rank fits" needs the width of "10" in the mono face, which node
+  // cannot measure. 0.6em per glyph is an upper bound for the monospace
+  // stacks in --mono (a real browser measured 0.55em for this one, so the
+  // bound is conservative in the safe direction), and 2px comes off for the
+  // 1px borders the face draws inside its own box.
+  const MONO_ADVANCE_EM = 0.6;
+  const WIDEST_RANK_CHARS = Math.max(...RANKS.map((r) => rankLabel(`${r}S`).length));
+  eq(WIDEST_RANK_CHARS, 2, 'the widest rank label is two characters wide — that is the ten');
+  const rankNeeds = WIDEST_RANK_CHARS * MONO_ADVANCE_EM * rankPx + 2;
+
+  // Three rows is the dock's budget. Measured on a real 320x568 screen: at
+  // three rows the dock is 285px of a 568px viewport and every default hand
+  // still fits above it. A fourth row does not fit on any phone in this list.
+  const ROW_BUDGET = 3;
+
+  const WIDTHS = [320, 360, 375, 390, 414, 430, maxw, 1280];
+  const strips = [];
+  const overflows = [];
+  const tooTall = [];
+  let swept = 0;
+
+  for (const W of WIDTHS) {
+    const w = cardAt(W);
+    const h = w / CARD_RATIO;
+    for (let n = 1; n <= MAX_HAND_CEILING; n++) {
+      swept++;
+      // A card is card-shaped. With aspect-ratio doing the work this holds by
+      // construction, which is the point: the old rule could not have passed
+      // it at any hand size past five.
+      if (Math.abs(w / h - CARD_RATIO) > 1e-9) strips.push(`${W}px x${n}: ${(w / h).toFixed(2)}`);
+      // The rank fits inside the face it belongs to.
+      if (w - 2 < rankNeeds) overflows.push(`${W}px x${n}: ${w.toFixed(1)}px face, needs ${rankNeeds.toFixed(1)}px`);
+      // And the hand fits in the dock's height budget.
+      const r = rowsFor(n, W);
+      if (r > ROW_BUDGET) tooTall.push(`${W}px x${n}: ${r} rows`);
+    }
+  }
+
+  for (const s of strips.slice(0, 5)) console.error(`  ✗ FAIL: card is not card-shaped at ${s}`);
+  for (const s of overflows.slice(0, 5)) console.error(`  ✗ FAIL: the rank does not fit at ${s}`);
+  for (const s of tooTall.slice(0, 5)) console.error(`  ✗ FAIL: the hand needs too many rows at ${s}`);
+  eq(strips.length, 0, `every hand card keeps the card ratio ${CARD_RATIO.toFixed(3)}, over ${swept} cases`);
+  eq(overflows.length, 0,
+    `and the widest rank fits inside every one of them (needs ${rankNeeds.toFixed(1)}px, floor is ${handW.min}px)`);
+  eq(tooTall.length, 0, `and no legal hand needs more than ${ROW_BUDGET} rows on any of these widths`);
+
+  // The old rule, run through the same model, to prove the sweep bites. If
+  // this ever stops failing, the sweep has stopped measuring anything.
+  const OLD = { w: (W) => Math.min(58, (avail(W) - (10 - 1) * gapAt(W)) / 10), h: 78 };
+  const oldRatio = OLD.w(375) / OLD.h;
+  ok(oldRatio < 0.5,
+    `the rule this replaced produced ${oldRatio.toFixed(2)} at ten cards on a 375px phone, `
+    + `against ${CARD_RATIO.toFixed(2)} for a real card — the sweep above would have caught it`);
+
+  console.log(`  hand geometry: floor ${handW.min}px / cap ${handW.max}px, ratio ${CARD_RATIO.toFixed(3)}, `
+    + `${swept} (width x hand size) cases, ${WIDTHS.length} widths, up to ${MAX_HAND_CEILING} cards; `
+    + `per-row at 320/375/${maxw}px = ${perRow(320)}/${perRow(375)}/${perRow(maxw)}`);
+
+  // --- 8. the fanned hand, which is a SECOND geometry --------------------
+  //
+  // Everything above is the play screen's hand: every card is a tap target, so
+  // every card gets its own space and the row wraps. During bidding nothing is
+  // tappable, so .hand.fan overlaps the cards into one row at any size — and
+  // an overlapped card is only as good as the sliver of it left showing.
+  //
+  // Which makes this a different invariant with a different failure mode. Up
+  // there the question is "is the card card-shaped"; here the card is always
+  // 44x62 and the question is "can you still READ it". The two cannot share a
+  // sweep, and the reason to check the second at all is that the first one
+  // passes whatever the fan does.
+  // The left of a four-value padding shorthand. Unitless zero is spelled `0`
+  // and not `0px`, so a pattern that demands the unit on every side reads the
+  // whole declaration as absent — which is a test failing over CSS style
+  // rather than over layout.
+  const fanPad = (declOf('.hand.fan .card', 'padding') || '').trim().split(/\s+/);
+  const fanPadL = fanPad.length === 4 && /^(0|[\d.]+px)$/.test(fanPad[3])
+    ? parseFloat(fanPad[3]) : null;
+  // clamp(<min>px, <n>cqw, <max>px) — the slot's width, not the window's, so
+  // this is a different clamp shape from clampOf above and needs its own read.
+  const fanRank = (declOf('.hand.fan .card-rank', 'font-size') || '')
+    .match(/clamp\(\s*([\d.]+)px\s*,\s*([\d.]+)cqw\s*,\s*([\d.]+)px\s*\)/);
+  const fanCap = deref((declOf('.hand.fan .card-btn', 'max-width') || '').trim());
+  const fanLast = deref(((declOf('.hand.fan .card-btn:last-child', 'flex') || '')
+    .match(/0\s+0\s+(\S+)/) || [])[1]);
+
+  const fanRead = { fanPadL, fanRank, fanCap, fanLast };
+  const fanMissing = Object.entries(fanRead).filter(([, v]) => v === null || v === undefined).map(([k]) => k);
+  eq(fanMissing.length, 0, `the fan's geometry was found in app.css${
+    fanMissing.length ? ` — missing: ${fanMissing.join(', ')}` : ''}`);
+  if (fanMissing.length) return;
+
+  const padL = +fanPadL;
+  const rankFloor = +fanRank[1];
+  const rankCap = +fanRank[3];
+
+  // The mechanism. Without nowrap the fan is just the wrapping hand with no
+  // gap, and the whole saving disappears silently — the cards would still be
+  // readable, so nothing below would catch it.
+  eq((declOf('.hand.fan', 'flex-wrap') || '').trim(), 'nowrap',
+    'the fanned hand does not wrap — one row is what it is for');
+  eq((declOf('.hand.fan', 'gap') || '').trim(), '0',
+    'and the cards touch, because a gap between overlapping cards is a contradiction');
+  // The cap is what makes them OVERLAP rather than spread out. Asserted
+  // against the base card rather than against 44, so retuning the card moves
+  // the cap with it.
+  eq(px(fanCap), baseW,
+    `a fanned slot is capped at one card width (${baseW}px), so a small hand packs instead of fanning`);
+  eq(px(fanLast), baseW, 'and the last card gets a whole slot — nothing paints over it');
+
+  // THE PROPERTY. The visible sliver of a card is the slot width, and the slot
+  // width is what is left of the row once the last card has taken a whole one:
+  //
+  //     sliver(n, W) = (avail(W) - baseW) / (n - 1)
+  //
+  // Into that sliver goes the card's left padding and then the widest rank.
+  // Note what is NOT in that sum on the play-screen side: up there the rank is
+  // checked against the whole face, because the whole face is visible. Here it
+  // is checked against the sliver AND offset by the padding, which is the
+  // distinction the first attempt got wrong — 11px passed a check against the
+  // sliver alone and clipped the ten by 1.36px in a real browser.
+  const sliver = (n, W) => (n <= 1 ? baseW : (avail(W) - baseW) / (n - 1));
+  // The rank shrinks with the slot but never below the floor, so the floor is
+  // what binds on the narrow end — exactly where the sliver is thinnest.
+  //
+  // Parameterised by the floor, and BOTH the sweep and the "largest that
+  // clears" pin below go through it. That is not tidiness: with the pin
+  // written out in longhand, deleting the padding term from this function
+  // changed no verdict — the sweep got more permissive and the pin was a
+  // separate copy of the arithmetic that still had the term. A mutation run
+  // caught it. One definition of "what has to fit" means weakening it breaks
+  // the pin instead of quietly widening the sweep.
+  const needsWith = (floor, n, W) => padL + WIDEST_RANK_CHARS * MONO_ADVANCE_EM
+    * Math.min(Math.max(floor, (fanRank[2] / 100) * sliver(n, W)), rankCap);
+  const fanNeeds = (n, W) => needsWith(rankFloor, n, W);
+
+  const clipped = [];
+  let fanSwept = 0;
+  let tightest = { slack: Infinity };
+  for (const W of WIDTHS) {
+    for (let n = 1; n <= MAX_HAND_CEILING; n++) {
+      fanSwept++;
+      const slack = sliver(n, W) - fanNeeds(n, W);
+      if (slack < tightest.slack) tightest = { slack, n, W };
+      if (slack < 0) {
+        clipped.push(`${W}px x${n}: ${sliver(n, W).toFixed(2)}px sliver, needs ${fanNeeds(n, W).toFixed(2)}px`);
+      }
+    }
+  }
+  for (const s of clipped.slice(0, 5)) console.error(`  ✗ FAIL: the fan hides the rank at ${s}`);
+  eq(clipped.length, 0,
+    `every fanned card shows its rank, over ${fanSwept} cases — tightest is `
+    + `${tightest.slack.toFixed(2)}px at ${tightest.W}px x${tightest.n}`);
+
+  // And the floor is the LARGEST that clears, pinned from both sides like the
+  // 38px one above. A floor with room to spare is a floor someone will round
+  // up to 11 or 12 "to make it readable", which is precisely what happened and
+  // what shipped a clipped ten. One pixel more and the worst case fails.
+  const worstSliver = sliver(MAX_HAND_CEILING, NARROWEST);
+  eq(worstSliver, Math.min(...Array.from({ length: MAX_HAND_CEILING },
+    (_, i) => sliver(i + 1, NARROWEST))),
+  `the thinnest sliver in the game is the fullest hand on the narrowest phone `
+    + `(${worstSliver.toFixed(2)}px), not some hand size in the middle`);
+  ok(needsWith(rankFloor, MAX_HAND_CEILING, NARROWEST) <= worstSliver,
+    `the ${rankFloor}px rank floor plus ${padL}px of padding fits that sliver `
+    + `(needs ${needsWith(rankFloor, MAX_HAND_CEILING, NARROWEST).toFixed(2)}px)`);
+  ok(needsWith(rankFloor + 1, MAX_HAND_CEILING, NARROWEST) > worstSliver,
+    `and it is the largest that does — at ${rankFloor + 1}px the ten would be clipped`);
+
+  console.log(`  fan geometry: slot capped at ${baseW}px, rank ${rankFloor}-${rankCap}px over `
+    + `${fanRank[2]}cqw, ${padL}px padding; ${fanSwept} cases, thinnest sliver `
+    + `${worstSliver.toFixed(2)}px at ${NARROWEST}px x${MAX_HAND_CEILING}`);
+})();
+
+// ===========================================================================
+section('UI: the play shell can shrink, so the hand stays on the screen');
+// ===========================================================================
+//
+// The play shell is `height: 100dvh` and does not scroll. Inside it the strip
+// and the hand dock are `flex: none` and pinned to the two edges, and one
+// middle band is expected to absorb everything else. If that band cannot
+// actually shrink, it does not overflow tidily — it pushes the dock past the
+// bottom of the screen, and the cards you are being asked to play are gone.
+//
+// `flex: 1 1 auto` LOOKS like it says "shrink me" and does not: a flex item's
+// automatic minimum size is its content size, so the band stops shrinking at
+// its content however large the shrink factor. It needs min-height: 0 as
+// well, and that is three characters that read like a redundant no-op next to
+// the `1 1 auto` — precisely the kind of thing a tidy-up deletes.
+//
+// THIS WAS BROKEN ON EVERY PHASE FOR NINE CHECKPOINTS and no assertion asked.
+// Not a regression from the wrapping hand either: measured in a browser, the
+// pre-existing one-row geometry pushed the dock to 619-750px on a 568px
+// screen. The suite could tell you a card was card-shaped and not that it was
+// off the bottom of the phone.
+//
+// The bands are DERIVED FROM A RENDER, not listed. A list of three selectors
+// is right until someone adds a fourth phase, and the fourth phase is exactly
+// when nobody remembers this file. So: render each phase, ask the play shell
+// what its children are, and hold every child that is allowed to grow to the
+// same three rules.
+{
+  const rules = cssRules('css/app.css');
+
+  // Which rules apply to a node, given that everything in this stylesheet
+  // targets elements by class. A selector matches if it is a chain of classes
+  // the node has; among matches, more classes wins, and ties go to whichever
+  // was declared later. That is the cascade for class-only selectors, which
+  // is all this file uses in the shell.
+  //
+  // Grouped selectors are split, because the rule under test is written as
+  // one `.bid-wrap, .trick-area, .interstitial {` — a reader that compares
+  // whole selector strings finds nothing and reports the band as unstyled.
+  const declFor = (classes, prop) => {
+    let best = null;
+    rules.forEach((r, order) => {
+      if (r.at) return; // conditional: not what the layout IS, see cssDecl
+      for (const part of r.sel.split(',')) {
+        const sel = part.trim();
+        if (!/^(\.[\w-]+)+$/.test(sel)) continue;
+        const want = sel.split('.').filter(Boolean);
+        if (!want.every((c) => classes.includes(c))) continue;
+        for (const d of r.body.split(';')) {
+          const m = d.match(/^\s*([\w-]+)\s*:\s*(.+?)\s*$/);
+          if (!m || m[1] !== prop) continue;
+          const rank = want.length;
+          if (!best || rank > best.rank || (rank === best.rank && order >= best.order)) {
+            best = { value: m[2], rank, order, sel };
+          }
+        }
+      }
+    });
+    return best;
+  };
+
+  // An engine stopped in each phase the play shell has a face for. Built from
+  // PHASES rather than from three string literals, so a new phase arrives here
+  // as a missing case rather than as silence.
+  const shells = new Map();
+  const seen = new Set();
+  const unreached = [];
+  for (const phase of Object.values(PHASES)) {
+    // Not every phase is on the path of a played match: LOBBY is behind the
+    // start, and TRUMP_REVEAL only happens under the methods that flip a
+    // card. playMatchUntil THROWS when its predicate never holds, so a miss
+    // has to be caught rather than tested for — and it is recorded, because
+    // "this phase was never checked" is a thing the reader needs told. Two
+    // configs, since the second may enter a phase the first cannot.
+    let g = null;
+    for (const config of UI_CONFIGS) {
+      try {
+        g = playMatchUntil({ config, players: 4 }, (e) => e.phase === phase);
+        break;
+      } catch (_) { /* this config never gets there; try the next */ }
+    }
+    if (!g) { unreached.push(phase); continue; }
+    const me = g.seats[g.turnSeat >= 0 ? g.turnSeat : 0].id;
+    const r = draw(baseApp({ screen: 'game', pub: g.publicState(), priv: g.privateStateFor(me) }));
+    const shell = walk(r.root).find((n) => n.classList && n.hasClass && n.hasClass('shell-play'));
+    if (!shell) continue;
+    seen.add(phase);
+    for (const child of shell.children || []) {
+      if (!child.classList || !child.classList.length) continue;
+      shells.set(child.classList.join('.'), child.classList);
+    }
+  }
+  ok(seen.size >= 3, `the play shell was rendered in ${seen.size} phases: ${[...seen].join(', ')}`);
+  ok(shells.size >= 3, `and offered ${shells.size} distinct children to check`);
+
+  // Now the property, over whatever that render turned up.
+  const growers = [];
+  const cannotShrink = [];
+  const cannotScroll = [];
+  const unsafeCentre = [];
+  for (const [key, classes] of shells) {
+    const flex = declFor(classes, 'flex');
+    if (!flex || !/^1\s+1\s+auto$/.test(flex.value.trim())) continue;
+    growers.push(key);
+
+    const minH = declFor(classes, 'min-height');
+    if (!minH || !/^0(px)?$/.test(minH.value.trim())) {
+      cannotShrink.push(`.${key} (min-height ${minH ? minH.value : 'unset'})`);
+    }
+    const ovf = declFor(classes, 'overflow-y') || declFor(classes, 'overflow');
+    if (!ovf || !/^(auto|scroll)$/.test(ovf.value.trim())) {
+      cannotScroll.push(`.${key} (overflow ${ovf ? ovf.value : 'unset'})`);
+    }
+    // Centring is optional; centring UNSAFELY is not. A centred flex line that
+    // overflows overflows in both directions, so the start edge goes out of
+    // reach and scrolling cannot bring it back — the lede and the first row of
+    // bid buttons simply are not there.
+    const jc = declFor(classes, 'justify-content');
+    if (jc && /center/.test(jc.value) && !/\bsafe\b/.test(jc.value)) {
+      unsafeCentre.push(`.${key} (justify-content: ${jc.value})`);
+    }
+  }
+
+  ok(growers.length >= 3,
+    `${growers.length} bands in the play shell are allowed to grow: ${growers.join(', ')}`);
+  for (const s of cannotShrink) console.error(`  ✗ FAIL: ${s} can grow but not shrink`);
+  for (const s of cannotScroll) console.error(`  ✗ FAIL: ${s} can be clipped with no way to scroll`);
+  for (const s of unsafeCentre) console.error(`  ✗ FAIL: ${s} centres unsafely`);
+  eq(cannotShrink.length, 0,
+    'every band that may grow may also shrink — min-height: 0, or the dock goes off the screen');
+  eq(cannotScroll.length, 0,
+    'and whatever a shrunk band cuts off can still be scrolled to');
+  eq(unsafeCentre.length, 0,
+    'and no band centres so hard that its first line becomes unreachable');
+
+  // The strip and the dock must NOT be in that set: they are the fixed edges,
+  // and the day one of them starts flexing the whole argument above changes.
+  for (const fixed of ['play-strip', 'hand-dock']) {
+    const f = declFor([fixed], 'flex');
+    eq(f && f.value.trim(), 'none', `.${fixed} is pinned, not flexible — it is one of the two edges`);
+  }
+
+  console.log(`  play shell: ${seen.size} phases rendered, ${shells.size} children, `
+    + `${growers.length} growable (${growers.join(', ')})`
+    + (unreached.length ? `; not reached: ${unreached.join(', ')}` : ''));
+}
+
 // ===========================================================================
 section('UI: it renders every phase, from every seat, without throwing');
 // ===========================================================================
@@ -4285,7 +5804,9 @@ section('UI: it renders every phase, from every seat, without throwing');
 // should ever set — a bad `screen` must land on home, not on a blank page.
 {
   let drawn = 0;
-  for (const screen of ['home', 'join', 'connecting', 'error', 'hostleft', 'game', 'nonsense']) {
+  ok(SCREENS.includes('replaced'),
+    'the screen list came from ui.js itself, so a new screen cannot be left undrawn');
+  for (const screen of SCREENS) {
     for (const name of ['', '  ', 'Ana']) {
       for (const isHost of [true, false]) {
         const r = draw(baseApp({
@@ -4299,12 +5820,69 @@ section('UI: it renders every phase, from every seat, without throwing');
       }
     }
   }
-  ok(drawn === 42, `${drawn} stateless frames drawn`);
+  // Derived, not typed. This read `42` and went red the moment a screen was
+  // added — a failure that says nothing about the UI and costs a reader ten
+  // minutes working out which of the three nested loops moved.
+  eq(drawn, SCREENS.length * 3 * 2, `${drawn} stateless frames drawn, over ${SCREENS.length} screens`);
 
   // With no pub, the game screen has to fall back rather than throw — this is
   // the window between "joined" and "first state arrived", and it is real.
   const r = draw(baseApp({ screen: 'game', pub: null, priv: null }));
   ok(byClass(r.root, 'spinner').length > 0, 'a game screen with no state yet shows the connecting spinner');
+}
+
+{
+  // --- the screen a superseded tab lands on --------------------------------
+  //
+  // Two terminal screens now, and they are terminal for different reasons.
+  // 'hostleft' has nothing to reconnect TO. 'replaced' has somewhere very
+  // much alive to reconnect to, and must not.
+  // Draw a screen, press everything on it, and report what it was able to
+  // ask for. `force` so that a disabled control still reports its intent —
+  // the question here is what the screen OFFERS, not what it permits today.
+  const canDo = (screen) => {
+    const { calls, intents } = spyIntents();
+    render(uiRoot, baseApp({ screen, isHost: false, pub: null, priv: null }), intents);
+    const controls = interactive(uiRoot);
+    for (const node of controls) node.click({}, { force: true });
+    return { names: [...new Set(calls.map((c) => c.name))].sort(), controls: controls.length };
+  };
+
+  const replaced = canDo('replaced');
+  const hostleft = canDo('hostleft');
+  ok(replaced.controls > 0, `${replaced.controls} controls on the screen, so this is not an empty sweep`);
+
+  // SIBLING OF hostleft, ASSERTED AS ONE. Both are terminal; they should end
+  // in the same place. Stated as a comparison rather than as a list, because
+  // a list would have to be edited on the day the rules button moves and a
+  // comparison would not.
+  same(replaced.names, hostleft.names,
+    'it offers exactly what the other terminal screen offers, and nothing more');
+  ok(replaced.names.includes('goHome'), 'including a way out');
+
+  // AND NOTHING THAT DIALS. Derived: whatever the two screens that can get
+  // onto the network offer and a terminal screen does not. A "RECONNECT" or
+  // "TRY AGAIN" button here would take the seat off the tab that currently
+  // holds it and hand this one the same screen — the loop the whole change
+  // is about, with a finger on it. It is exactly the button a future reader
+  // would think was missing, so the ban is a test and not a comment.
+  const onward = [...new Set([...canDo('home').names, ...canDo('join').names])]
+    .filter((n) => !hostleft.names.includes(n));
+  ok(onward.length >= 2, `${onward.length} intents belong to the screens that start connections: ${onward.join(', ')}`);
+  same(onward.filter((n) => replaced.names.includes(n)), [],
+    'and the replaced screen offers none of them — there is no way to fight for the seat from here');
+
+  render(uiRoot, baseApp({ screen: 'replaced', isHost: false, pub: null, priv: null }), spyIntents().intents);
+  const said = walk(uiRoot)
+    .map((n) => (typeof n.text === 'string' ? n.text : ''))
+    .join(' ')
+    .toLowerCase();
+
+  // NAMES THE CAUSE, NOT THE SYMPTOM. "Disconnected" is true and useless:
+  // somebody who has not realised they have two tabs open cannot act on it.
+  ok(/another tab/.test(said), 'the screen says another tab, which is the thing the player can act on');
+  ok(!/error|failed|sorry/.test(said), 'and does not dress a mundane thing up as a fault');
+  ok(byClass(uiRoot, 'spinner').length === 0, 'with no spinner suggesting something is still in progress');
 }
 
 // A whole match under each of the three scoring modes and each trump method,
@@ -4329,11 +5907,11 @@ function sweepMatch(config, players, visit) {
   });
 }
 
-const UI_CONFIGS = [
-  { scoring: 'kachuful', trumpMethod: 'rotation', shape: 'descending', hook: true, maxHand: 4 },
-  { scoring: 'square', trumpMethod: 'turnup', shape: 'downup', hook: false, maxHand: 3 },
-  { scoring: 'standard', trumpMethod: 'rotation-nt', shape: 'ascending', hook: true, maxHand: 3 },
-];
+// UI_CONFIGS was declared here, beside the UI sweeps that were its only
+// caller. It moved up next to playMatch() when the engine's "the public view
+// cannot move the engine" section wanted the same three configs — a const is
+// not hoisted, so using it above its declaration is a TDZ crash rather than
+// an undefined.
 
 // THE LOBBY IS NOT REACHABLE FROM sweepMatch, and it has to be built by hand.
 // playMatch() starts the match in its first statement, so every frame that
@@ -5164,7 +6742,7 @@ section('UI: the rules are one tap away, from every screen there is');
 
   // The screens with no engine behind them, including a screen name nothing
   // should ever set — that falls through to home, which has one.
-  for (const screen of ['home', 'join', 'connecting', 'error', 'hostleft', 'game', 'nonsense']) {
+  for (const screen of SCREENS) {
     check(baseApp({ screen, pub: null, priv: null, error: 'The room is full.' }), `screen ${screen}`);
   }
 
@@ -5360,7 +6938,10 @@ section('UI: every drawer has a way IN, not just a way out');
   // The engineless screens and the lobby, which is where plainFrames comes
   // from: neither drawer is offered there and neither should be, so these
   // frames are what stops the scoping above from being the assertion.
-  for (const screen of ['home', 'join', 'connecting', 'error', 'hostleft']) {
+  // Everything except 'game', which is the one screen here that needs an
+  // engine behind it and gets swept separately below. 'nonsense' stays in:
+  // it falls through to home, which offers no drawer either.
+  for (const screen of SCREENS.filter((s) => s !== 'game')) {
     check({ screen, pub: null, priv: null }, `screen ${screen}`);
   }
   sweepLobby((g, pub, priv, id) => {
@@ -5976,13 +7557,70 @@ section('The wire: three frame types, each written and read by one pair');
     eq(readRejectFrame(notReject), null, `readRejectFrame refuses ${JSON.stringify(notReject)}`);
   }
 
-  // Three types is the whole protocol, and they have to be three different
-  // strings or a reader would answer the wrong question.
-  eq(new Set(Object.values(WIRE)).size, 3, 'the three wire types are three distinct strings');
+  // The whole protocol, and every type in it has to be a different string or
+  // a reader would answer the wrong question.
+  //
+  // COUNTED AGAINST ITSELF, not against a number typed here. This assertion
+  // used to read `3`, and the fourth type landing turned a real property —
+  // "they are all distinct" — into a failing arithmetic check that says
+  // nothing about distinctness at all. The count is printed so the growth is
+  // still visible in the output; it is just not the thing being asserted.
+  eq(new Set(Object.values(WIRE)).size, Object.keys(WIRE).length,
+    `all ${Object.keys(WIRE).length} wire types are distinct strings`);
   ok(Object.isFrozen(WIRE), 'and the vocabulary is frozen');
   for (const t of Object.values(WIRE)) {
     ok(!GAME_INTENTS.includes(t), `'${t}' is not also a game intent — the two vocabularies do not overlap`);
   }
+}
+
+{
+  // REPLACED. Last words to a connection whose seat has just gone to another
+  // connection holding the same ticket. Carries nothing; the fact IS the frame.
+  ok(isReplacedFrame(replacedFrame()), 'the replaced pair round-trips');
+  eq(Object.keys(replacedFrame()).length, 1,
+    'and the frame is a type and nothing else — no field to be suspicious of');
+
+  // IT MUST NOT ANSWER TO ANY OTHER FRAME, and the three it shares a wire with
+  // are the ones that matter: a state frame read as "you have been replaced"
+  // is a player thrown off a table they are sitting at.
+  const NOT_REPLACED = [
+    null, undefined, '', 0, false, [], {}, 'replaced',
+    { type: WIRE.STATE }, { type: WIRE.JOIN }, { type: WIRE.REJECTED },
+    { type: 'playCard' }, { type: 'placeBid' },
+    { replaced: true }, { type: null }, { type: ['replaced'] },
+  ];
+  let wrongly = 0;
+  for (const junk of NOT_REPLACED) {
+    let out;
+    try { out = isReplacedFrame(junk); } catch (_) { wrongly++; continue; }
+    if (out !== false) wrongly++;
+  }
+  eq(wrongly, 0, `none of the ${NOT_REPLACED.length} non-replaced values is read as one, and none throws`);
+
+  // WHAT IS DELIBERATELY NOT IN THAT LIST: an object with an INHERITED type,
+  // Object.create({ type: WIRE.REPLACED }). `msg.type` finds it and the
+  // predicate says yes. That was in the list for one draft as a tightening
+  // worth making, and it is not one: decodePeerFrame() hands on JSON.parse
+  // output, whose prototype is Object.prototype and never carries a `type`,
+  // so nothing that reaches any reader in this file can have one. Adding the
+  // check HERE and not to the other three would also make this the only
+  // reader with its own idea of what an object is. Recorded rather than
+  // deleted, because the next person to think of it deserves the answer.
+  ok(isReplacedFrame(Object.create({ type: WIRE.REPLACED })) === true,
+    'an inherited type reads as a frame — matching the other three readers, and unreachable from the wire');
+
+  // AND IT SURVIVES THE WIRE. Every frame is JSON in both directions, so a
+  // builder that produced something JSON cannot carry would be caught here
+  // and nowhere else.
+  ok(isReplacedFrame(JSON.parse(JSON.stringify(replacedFrame()))),
+    'and it still reads as one after a round trip through JSON');
+
+  // The other readers must not claim it. readRejectFrame() is the dangerous
+  // one: it is the fallback in main.js's onData, and if it answered to this
+  // the player would get an empty error banner instead of the screen.
+  eq(readRejectFrame(replacedFrame()), null, 'the refusal reader does not claim it');
+  eq(readStateFrame(replacedFrame()), null, 'nor does the state reader');
+  eq(readJoinFrame(replacedFrame()), null, 'nor the hello reader');
 }
 
 // ===========================================================================
@@ -7371,7 +9009,10 @@ function playUpToRound(clock, table, rounds) {
   eq(back.pub.roundIndex, snap.roundIndex, 'and the match still on the round it was on');
   eq(back.pub.seats[devSeat].name, snap.name, 'under the same name');
   eq(back.pub.seats[devSeat].isOwner, snap.isOwner, 'and the same standing in the room');
-  same(back.priv.hand.map((c) => c.code), snap.hand,
+  // Sorted, for the reason spelled out at the impostor test below: the frame
+  // carries the display fan, snap.hand is the dealt order, and the two agree
+  // only by luck of the shuffle.
+  same(back.priv.hand.map((c) => c.code), sortHand(snap.hand, table.engine.trump),
     'and the private half is that seat\'s own hand, card for card');
 
   // THE STALE CONNECTION IS STILL OUT THERE, and this is the part that is
@@ -7420,6 +9061,352 @@ function playUpToRound(clock, table, rounds) {
   net.uninstall();
 }
 
+// ---------------------------------------------------------------------------
+// THE SECOND TAB, which is the same story with one thing changed: the old
+// connection is not dead.
+//
+// Everything above uses vanish() — a phone in a tunnel — and that is the case
+// seat reclaim was built for. But a clientId is stored in localStorage, and
+// localStorage belongs to the ORIGIN, not to the tab. Open the game twice in
+// one browser and the second tab dials with the first tab's ticket while the
+// first tab is sitting there perfectly healthy.
+//
+// The host cannot tell the two apart and must not try. What it can do is say
+// so on the way out, which is the whole of WIRE.REPLACED.
+//
+// Both halves are exercised below: the fix, and the same table with the frame
+// ignored. The second run is not decoration. Without it, a test that asserts
+// "two tabs settle down" passes just as happily against a transport that
+// never lets a second tab connect at all.
+// ---------------------------------------------------------------------------
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+
+  // How many times a tab will re-dial before this test gives up and calls it
+  // a loop. Low enough to run fast, high enough that no honest reconnect
+  // sequence reaches it — the real ladder in main.js has five rungs.
+  const DIAL_CAP = 12;
+
+  /**
+   * One table, with a host whose onJoin is js/main.js's onJoin: find the seat
+   * this ticket already holds, rebind it, and retire whatever connection was
+   * on it. Written out rather than taken from liveTable() because liveTable's
+   * host does not do the retiring, and the retiring is the subject.
+   */
+  function tabsTable(code) {
+    const engine = new GameEngine();
+    engine.addPlayer(HOST_ID, 'Ana', { clientId: 'host-ticket-tabs', isOwner: true });
+    const sent = { replaced: 0, drops: [] };
+    let host = null;
+    const push = () => host.pushState(engine.publicState(), (id) => engine.privateStateFor(id));
+
+    host = createHost(code, {
+      onConnect: (pid) => host.sendTo(pid, stateFrameFor(connIdForPlayer(pid),
+        engine.publicState(), (id) => engine.privateStateFor(id))),
+      onJoin: (pid, hello) => {
+        if (!hello) { host.sendTo(pid, rejectFrame('Enter a name first.')); return; }
+        const prior = engine.seats.find((s) => s.clientId && s.clientId === hello.clientId);
+        const stale = prior && prior.id !== pid ? prior.id : null;
+        const r = engine.addPlayer(pid, hello.name, { clientId: hello.clientId });
+        if (!r.ok) { host.sendTo(pid, rejectFrame(r.error)); return; }
+        if (stale) {
+          // THE ORDER IS THE FIX. Tell it why, then retire it.
+          host.sendTo(stale, replacedFrame());
+          sent.replaced++;
+          sent.drops.push(stale);
+          host.dropConnection(stale);
+        }
+        push();
+      },
+      onData: (pid, msg) => {
+        const { handled, result } = applyGameIntent(engine, pid, msg, clock.elapsed());
+        if (handled && !result.ok) host.sendTo(pid, rejectFrame(result.error));
+        if (handled) push();
+      },
+      onDisconnect: (pid) => { engine.disconnect(pid); push(); },
+    });
+    clock.advance(10);
+
+    /**
+     * Get off the lobby, and it is not optional.
+     *
+     * disconnect() SPLICES THE SEAT OUT in PHASES.LOBBY — a player who leaves
+     * a lobby has left, and the chair goes with them. So every assertion
+     * about a seat being reclaimed rather than re-created is vacuous until a
+     * match is on: the seat the second connection gets is a brand new one
+     * that happens to sit in the same index, and nothing distinguishes the
+     * two. The first version of the tunnel case below ran in the lobby and
+     * reported that the host never sent a farewell, which was true and was
+     * about the setup rather than about the code.
+     */
+    const start = () => {
+      engine.setConfig(HOST_ID, { maxHand: 3, shape: 'descending',
+        trumpMethod: 'turnup', scoring: 'kachuful' });
+      const r = engine.startMatch(HOST_ID, clock.elapsed());
+      ok(r.ok, `the match is on, so a seat is worth reclaiming (${code})`);
+      ok(engine.phase !== PHASES.LOBBY, 'and a disconnect no longer vacates a chair');
+      push();
+      clock.advance(10);
+    };
+
+    return { engine, host, sent, push, start };
+  }
+
+  /**
+   * A TAB — js/main.js's client half, reduced to the three handlers that
+   * decide whether to dial again.
+   *
+   * `honourReplaced` is the switch between the two worlds. True is what
+   * main.js does now: onReplaced calls teardown(), whose netEpoch++ makes the
+   * onClose a millisecond later inert. False is what it did before the frame
+   * existed — the close arrives looking exactly like a dead channel, and the
+   * ladder starts.
+   */
+  function openTab(table, code, name, ticket, { honourReplaced = true } = {}) {
+    const tab = { name, ticket, dials: 0, replaced: 0, closes: 0, states: 0,
+      data: [], order: [], stopped: false, capped: false, handles: [] };
+
+    // main.js's netEpoch, and it is in here because leaving it out made this
+    // helper lie. beginJoin(code, resuming) destroys the client it is
+    // replacing and THEN bumps the counter, so the rung before this one
+    // cannot answer for it — without that, the dying rung's own close looks
+    // like a dropped connection and dials a rung of its own.
+    let epoch = 0;
+
+    const dial = () => {
+      if (tab.dials >= DIAL_CAP) { tab.capped = true; return; }
+      tab.dials++;
+      if (tab.net) { try { tab.net.destroy(); } catch (_) {} }
+      const mine = ++epoch;
+      tab.net = joinHost(code, {
+        onState: () => { tab.states++; },
+        onReplaced: () => {
+          tab.replaced++;
+          tab.order.push('replaced');
+          if (!honourReplaced) return;
+          tab.stopped = true;   // stands in for teardown()'s netEpoch++
+        },
+        onData: (msg) => tab.data.push(msg),
+        onClose: () => {
+          // Counted before it is judged, so the assertions can say the close
+          // ARRIVED and was ignored — which is a different claim from it
+          // never having happened, and the weaker one is easy to pass.
+          tab.closes++;
+          tab.order.push('close');
+          if (tab.stopped) return;      // superseded: main.js has torn down
+          if (mine !== epoch) return;   // a rung we have already moved past
+          dial();
+        },
+      }, { name, clientId: ticket });
+      tab.handles.push(tab.net);
+    };
+
+    dial();
+    clock.advance(20);
+    // Stands in for the reconnect ladder's timer. vanish() fires no close on
+    // either end, so nothing in here can notice a tunnel by itself — in the
+    // app that is joinTimer's job, and a fake one is honest about the fact
+    // that the noticing is not what is under test.
+    tab.redial = dial;
+    return tab;
+  }
+
+  const seatOfTicket = (engine, ticket) =>
+    engine.seats.findIndex((s) => s.clientId === ticket);
+
+  // --- with the frame honoured ---------------------------------------------
+  {
+    const t = tabsTable('ZZ29');
+    const TICKET = 'ticket-one-device';
+
+    const fillers = [openTab(t, 'ZZ29', 'Dee', 'ticket-dee'),
+      openTab(t, 'ZZ29', 'Eli', 'ticket-eli')];
+    const first = openTab(t, 'ZZ29', 'Bo', TICKET);
+    clock.advance(30);
+    t.start();
+
+    const seat = seatOfTicket(t.engine, TICKET);
+    ok(seat > 0, `the first tab is seated in seat ${seat}`);
+    eq(t.engine.seats.length, 4, 'four at the table');
+    ok(first.states > 0, 'and it is being sent the table');
+    ok(t.engine.hands[seat].length > 0, 'holding cards, which is what makes the seat worth taking');
+
+    // THE SECOND TAB. Same browser, same localStorage, therefore the same
+    // ticket — and the first tab has not gone anywhere.
+    const second = openTab(t, 'ZZ29', 'Bo', TICKET);
+    clock.advance(200);
+
+    eq(t.engine.seats.length, 4, 'no fifth chair was invented for the same device');
+    eq(seatOfTicket(t.engine, TICKET), seat, 'the seat did not move along the table');
+    eq(t.sent.replaced, 1, 'the host said why exactly once');
+
+    eq(first.replaced, 1, 'the first tab was told it had been superseded');
+    eq(first.closes, 1, 'and then closed');
+    same(first.order, ['replaced', 'close'],
+      'in that order — the reason arrives before the close it explains');
+    eq(first.dials, 1, 'IT DID NOT DIAL AGAIN, which is the whole fix');
+    eq(first.capped, false, 'so it never reached the cap');
+
+    // The frame is intercepted by joinHost and must not also be handed on.
+    // main.js's onData would not crash on it, but it would be one more
+    // unrecognised type reaching applyGameIntent, and the handler that
+    // matters would have already missed its moment.
+    eq(first.data.length, 0, 'the replaced frame never reached onData');
+    eq(first.net.badFrames(), 0, 'and nothing it received was malformed');
+
+    // THE TAB THAT WON IS UNTOUCHED. Easy to lose sight of: a fix that
+    // quietened the first tab by breaking the second would pass every
+    // assertion above.
+    eq(second.replaced, 0, 'the tab that took the seat was not told anything');
+    eq(second.closes, 0, 'nor closed');
+    eq(second.dials, 1, 'nor made to dial again');
+    ok(second.states > 0, 'and it is the one receiving the table now');
+    eq(t.engine.seats[seat].connected, true, 'the seat stayed connected throughout');
+
+    // And the game still works through it — the point of taking the seat.
+    const before = second.states;
+    t.push();
+    clock.advance(20);
+    ok(second.states > before, 'a push after the handover reaches the surviving tab');
+
+    // AND IT HOLDS THE SAME HAND. The seat moved between connections; the
+    // cards did not move at all. A "fix" that re-seated the device would
+    // satisfy everything above and deal it a new hand mid-round.
+    const mine = second.states > 0 ? t.engine.privateStateFor(t.engine.seats[seat].id) : null;
+    ok(mine && mine.hand.length === t.engine.hands[seat].length,
+      'and it is holding the hand the seat came with, not a fresh one');
+
+    for (const h of [...first.handles, ...second.handles,
+      ...fillers.flatMap((f) => f.handles)]) h.destroy();
+    t.host.destroy();
+    clock.advance(50);
+  }
+
+  // --- and the same table with the frame ignored ---------------------------
+  //
+  // THE CONTROL, and it is the evidence. This is the code as it was: the
+  // frame arrives, nothing acts on it, and the close that follows is
+  // indistinguishable from a channel that died. Both tabs are behaving
+  // correctly and reasonably. They will still do this until one is closed.
+  {
+    const t = tabsTable('ZZ49');
+    const TICKET = 'ticket-one-device';
+
+    const fillers = [openTab(t, 'ZZ49', 'Dee', 'ticket-dee'),
+      openTab(t, 'ZZ49', 'Eli', 'ticket-eli')];
+    const first = openTab(t, 'ZZ49', 'Bo', TICKET, { honourReplaced: false });
+    clock.advance(30);
+    t.start();
+
+    const second = openTab(t, 'ZZ49', 'Bo', TICKET, { honourReplaced: false });
+    clock.advance(2000);
+
+    ok(first.dials > 1 || second.dials > 1,
+      'ignoring the frame, a superseded tab dials straight back');
+    ok(first.capped || second.capped,
+      `and the two of them trade the seat until the ${DIAL_CAP}-dial cap stops the test — this is the bug`);
+    ok(t.sent.replaced >= DIAL_CAP - 1,
+      `${t.sent.replaced} handovers for one device with one seat`);
+
+    // The loop costs a seat nothing and the table everything: the chair is
+    // always occupied, so nothing on the host looks wrong at any instant.
+    eq(t.engine.seats.length, 4, 'while the scoreboard shows four players, perfectly normal');
+
+    for (const h of [...first.handles, ...second.handles,
+      ...fillers.flatMap((f) => f.handles)]) h.destroy();
+    t.host.destroy();
+    clock.advance(50);
+  }
+
+  // --- the farewell sent to a channel that is already gone -----------------
+  //
+  // THIS PATH RUNS ON EVERY ORDINARY RECONNECT, which makes it the one that
+  // had to be got right. A phone in a tunnel is a reclaim too, and the host
+  // does not know the difference — so it addresses its last words to a
+  // channel that stopped existing minutes ago. A real DataChannel throws
+  // InvalidStateError on that, and this send happens INSIDE onJoin: a throw
+  // here does not lose a frame, it aborts the join, skips dropConnection and
+  // push(), and leaves the returning player on a spinner with their seat
+  // already rebound. One dead phone would take the table down.
+  //
+  // trySend() in js/net.js is what stops it, and before this test nothing
+  // made that line matter for this frame.
+  {
+    const t = tabsTable('ZZ59');
+    const TICKET = 'ticket-tunnel';
+
+    // ONE TAB, not two. A phone in a tunnel does not open a second page — the
+    // page it already has re-dials, and PeerJS mints a fresh peer id for it,
+    // so the host sees a new connection carrying an old ticket. Modelling it
+    // as two tabs was the first version of this test and it quietly tested
+    // the second-tab case again, with worse wording.
+    const fillers = [openTab(t, 'ZZ59', 'Dee', 'ticket-dee'),
+      openTab(t, 'ZZ59', 'Eli', 'ticket-eli')];
+    const phone = openTab(t, 'ZZ59', 'Cleo', TICKET);
+    clock.advance(30);
+    t.start();
+
+    const seat = seatOfTicket(t.engine, TICKET);
+    ok(seat > 0, `the phone is seated in seat ${seat}`);
+    eq(phone.dials, 1, 'on its first dial');
+    const handBefore = t.engine.hands[seat].slice();
+    ok(handBefore.length > 0, 'holding a hand it would hate to lose');
+
+    // The tunnel. No close on either end, and in-flight data is eaten — which
+    // is the one thing vanish() still does that a clean close does not.
+    const wire = broker.connectionsOf(phone.net.peer)[0];
+    ok(wire, 'the phone has a channel to lose');
+    wire.vanish();
+    clock.advance(50);
+    eq(t.engine.seats[seat].connected, true, 'and nothing below WebRTC tells the host');
+
+    // It comes back. The host now addresses its last words to a channel that
+    // stopped existing, before retiring the corpse.
+    let threw = null;
+    try {
+      phone.redial();
+      clock.advance(100);
+    } catch (e) { threw = e; }
+
+    eq(threw, null, 'sending the farewell to a dead channel does not throw out of onJoin');
+    eq(phone.dials, 2, 'the phone dialled once more, as the ladder does');
+    eq(t.engine.seats.length, 4, 'the seat came back rather than a new one being made');
+    eq(seatOfTicket(t.engine, TICKET), seat, 'the same seat');
+    eq(t.engine.seats[seat].connected, true, 'connected again');
+    same(t.engine.hands[seat], handBefore, 'holding the same cards it went into the tunnel with');
+
+    // The farewell was attempted. It went nowhere, which is fine and is the
+    // whole meaning of best-effort: the connection it was addressed to has
+    // nobody behind it to be confused by the silence.
+    eq(t.sent.replaced, 1, 'the host did try to say why, exactly once');
+    eq(phone.replaced, 0, 'the tunnel ate it, as a tunnel does');
+
+    // AND IT MUST NOT HAVE TOLD ITSELF. The farewell goes to the player id of
+    // the connection being retired, and on a reconnect that id belongs to the
+    // same human at the same table. Send it to the wrong one and a phone
+    // coming out of a tunnel lands on "open in another tab" and stays there —
+    // the reconnect case the brief singles out, broken by the fix for a
+    // different one.
+    eq(phone.stopped, false, 'and the device that came back was not told it had replaced itself');
+
+    // AND THE RECONNECT STILL WORKS, which is the case this whole change must
+    // not have broken.
+    const before = phone.states;
+    ok(before > 0, 'the returning device was sent the table — onJoin ran to the end');
+    t.push();
+    clock.advance(20);
+    ok(phone.states > before, 'and it keeps receiving it');
+
+    for (const h of [...phone.handles, ...fillers.flatMap((f) => f.handles)]) h.destroy();
+    t.host.destroy();
+    clock.advance(50);
+  }
+
+  net.uninstall();
+}
+
 {
   // --- a name is never a seat ticket ---------------------------------------
   //
@@ -7463,7 +9450,15 @@ function playUpToRound(clock, table, rounds) {
   const real = table.join('Dev', 'ticket-dev-004');
   clock.advance(50);
   eq(real.seat(), devSeat, 'while the real ticket gets the chair straight back');
-  same(real.last().priv.hand.map((c) => c.code), devHand, 'and the hand with it');
+  // AGAINST sortHand(), NOT AGAINST THE DEALT ORDER. privateStateFor() sorts
+  // the hand for display — trump pulled to the front, stable across sends so
+  // cards do not jump under a thumb — while engine.hands[] keeps the order it
+  // was dealt in. Comparing the two directly passes only when the shuffle
+  // happens to have dealt in display order, which is a coin toss that this
+  // assertion won for a long time and lost the moment an unrelated test
+  // above it started a match and moved the deck along.
+  same(real.last().priv.hand.map((c) => c.code), sortHand(devHand, table.engine.trump),
+    'and the hand with it, in the order the fan is drawn in');
 
   table.teardown();
   net.uninstall();
@@ -8051,8 +10046,8 @@ const ERROR_CORPUS = [
 //
 // ###########################################################################
 
-const REPO = fileURLToPath(new URL('../', import.meta.url));
-const readRepo = (rel) => readFileSync(REPO + rel, 'utf8');
+// REPO and readRepo are defined at the top of the file now — the UI section
+// reads js/ui.js as text as well, and it runs long before this one.
 
 section('The shell: every asset shipped, and every asset cached');
 
@@ -8069,28 +10064,16 @@ section('The shell: every asset shipped, and every asset cached');
   // expected list here would agree with a hand-written SHELL exactly as often
   // as both were edited together, which is the thing being guarded against.
 
-  const swSrc = readRepo('sw.js');
-
-  // Pull CACHE_NAME and SHELL out by executing the file, not by regex. A regex
-  // over source is a parser that does not report syntax errors.
-  let swModule = null;
-  try {
-    // eslint-disable-next-line no-new-func
-    swModule = new Function(
-      'self', 'caches', 'fetch', 'Response',
-      swSrc + '\n; return { CACHE_NAME, SHELL, SHELL_STAMP };'
-    );
-    passed++;
-  } catch (e) {
+  // Executing the file rather than regexing it, via loadSwConsts() at the top
+  // — shared with --write-stamp so that the writer and the checker cannot
+  // disagree about what sw.js says.
+  const constsOnly = loadSwConsts();
+  if (constsOnly.error) {
     failed++;
-    console.error('  ✗ FAIL: sw.js does not parse —', e.message);
+    console.error('  ✗ FAIL: sw.js does not parse —', constsOnly.error.message);
+  } else {
+    passed++;
   }
-
-  // A throwaway instantiation purely to read the two constants. The handlers
-  // it registers are dropped; the real drive happens further down.
-  const constsOnly = swModule
-    ? swModule({ addEventListener() {}, location: { origin: 'https://x.test' }, clients: {} }, {}, () => {}, class {})
-    : { CACHE_NAME: '', SHELL: [], SHELL_STAMP: '' };
 
   const SHELL = constsOnly.SHELL;
   const CACHE_NAME = constsOnly.CACHE_NAME;
@@ -8188,36 +10171,21 @@ section('The shell: every asset shipped, and every asset cached');
   ok(!SHELL.includes('./sw.js'),
     'sw.js does not precache itself — which is what makes a content stamp computable');
 
+  // The hash itself lives in shellStampOf() at the top of this file, because
+  // --write-stamp computes the same number and a second copy of the rule is a
+  // second rule. See the comment there.
+  //
+  // Hoisted out of the block below because the writer section further down
+  // compares against `computed` rather than against SHELL_STAMP. That is not a
+  // style choice: comparing the writer's answer to the file's literal would
+  // make the writer's assertions fail on every legitimately stale stamp, which
+  // in the mutation table means every row in it — and a diagnosis column that
+  // says the same thing for sixty different mutations has stopped being a
+  // diagnosis. Writer-agrees-with-checker is the property; is-the-file-current
+  // is already asserted once, below, and does not need saying twice.
+  const { stamp: computed, hashed, unreadable } = shellStampOf(SHELL);
+
   {
-    // './' and './index.html' are the same bytes from any static host; hashing
-    // both would count the page twice and, worse, would make the stamp depend
-    // on a listing decision rather than on content. Mapped and de-duplicated.
-    // Sorted, so the order of the SHELL array — which is written for humans,
-    // in dependency order — cannot change the answer.
-    const paths = [...new Set(SHELL.map((p) => (p === './' ? './index.html' : p)))].sort();
-
-    const BINARY = /\.(png|jpg|jpeg|ico|woff2?)$/;
-    const h = createHash('sha256');
-    let hashed = 0;
-    let unreadable = 0;
-    for (const p of paths) {
-      let bytes;
-      try { bytes = readFileSync(REPO + p.slice(2)); } catch (_) { unreadable++; continue; }
-      // LINE ENDINGS NORMALISED for text. A checkout on Windows and a checkout
-      // on Linux hold different bytes for the same commit, and without this
-      // the suite would fail on one of them for a reason that has nothing to
-      // do with the app. Binaries are hashed as-is — there are no line endings
-      // in a PNG, only pixels that happen to be 0x0D.
-      if (!BINARY.test(p)) bytes = Buffer.from(bytes.toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
-      // The path goes into the hash as well as the contents, with a separator,
-      // so that renaming a file changes the stamp even when its bytes do not —
-      // and so that two adjacent files cannot be concatenated into the same
-      // digest as one longer file.
-      h.update(p); h.update('\0'); h.update(bytes); h.update('\0');
-      hashed++;
-    }
-    const computed = h.digest('hex').slice(0, 12);
-
     // The pairing. A hash of nothing is still a hash, and it would compare
     // unequal and print a confident-looking value to paste. If the files could
     // not be read, say THAT instead.
@@ -8225,15 +10193,17 @@ section('The shell: every asset shipped, and every asset cached');
     ok(hashed >= 20, `the stamp is computed over ${hashed} files, not over an empty sweep`);
 
     if (SHELL_STAMP !== computed) {
-      // THE FAILURE PRINTS THE ANSWER. This is the difference between a check
-      // that enforces a rule and a check that nags about one: nobody has to
-      // work out what the new stamp is, or find the command that computes it,
-      // or know that line endings are normalised. They paste twelve
-      // characters. "Remember to bump this" becomes "the suite tells you".
+      // THE FAILURE FIXES ITSELF. This is the difference between a check that
+      // enforces a rule and a check that nags about one: nobody has to work
+      // out what the new stamp is, or know that line endings are normalised.
+      // They run one command. "Remember to bump this" becomes "the suite bumps
+      // it" — and the paste-this line stays below it for anyone who would
+      // rather see the twelve characters before a script touches their file.
       console.error('  ✗ FAIL: sw.js SHELL_STAMP is stale — the shell changed and the cache name did not.');
-      console.error(`           Returning visitors would keep the old build. Paste this into sw.js:`);
-      console.error(`               const SHELL_STAMP = '${computed}';`);
-      console.error(`           (currently '${SHELL_STAMP}', over ${hashed} files)`);
+      console.error('           Returning visitors would keep the old build. Fix it with:');
+      console.error('               npm run stamp');
+      console.error(`           (or paste: const SHELL_STAMP = '${computed}';`);
+      console.error(`            currently '${SHELL_STAMP}', over ${hashed} files)`);
     }
     eq(SHELL_STAMP, computed, 'SHELL_STAMP is the fingerprint of the files SHELL precaches');
 
@@ -8247,6 +10217,155 @@ section('The shell: every asset shipped, and every asset cached');
       'and the cache is named after it, with the prefix activate() deletes by');
 
     console.log(`  shell stamp: ${SHELL_STAMP} over ${hashed} files`);
+  }
+
+  // --- the writer that fixes a stale stamp ----------------------------------
+  //
+  // `npm run stamp` rewrites the line the check above enforces, which makes it
+  // the one piece of tooling in the repository that can turn this section
+  // green without anybody fixing anything. Its guards are therefore not a
+  // convenience — they are the reason it is allowed to exist — and they are
+  // driven here with inputs that could not be produced any other way without
+  // damaging the working tree to test the thing that protects it.
+  {
+    const realSw = loadSwConsts();
+    const plan = planStampWrite(realSw);
+
+    // THE HAPPY PATH FIRST, because every refusal below is only interesting if
+    // the writer would otherwise have said yes.
+    eq(plan.refuse, null, 'the stamp writer accepts the repository as it stands');
+    // AGAINST `computed`, NOT AGAINST THE FILE'S LITERAL. The property is that
+    // the writer and the checker arrive at the same number, and that stays
+    // true while the stamp is stale — which is the state the writer exists to
+    // resolve and the state every mutation in the table puts the tree into.
+    eq(plan.stamp, computed,
+      'and the number it would write is the number the check above demands — the writer and the checker cannot disagree');
+    eq(plan.was, SHELL_STAMP, 'it read the current value out of the file correctly');
+
+    // It rewrites the declaration and NOTHING ELSE. The sharpest way to say
+    // that is by length: a replacement of one twelve-character stamp with
+    // another leaves the file exactly as long, and any collateral edit —
+    // dropping the rest of the line, matching inside a comment, eating a
+    // newline — moves it. Derived from the real file so it stays true when
+    // sw.js grows.
+    const rewritten = realSw.src.replace(STAMP_ANCHOR, `const SHELL_STAMP = '${'0'.repeat(12)}';`);
+    eq(rewritten.length, realSw.src.length, 'writing a stamp changes the file length by nothing');
+    eq((rewritten.match(new RegExp(STAMP_ANCHOR.source, 'gm')) || []).length, 1,
+      'and leaves exactly one stamp declaration behind');
+    ok(rewritten.includes("const SHELL_STAMP = '000000000000';"),
+      'and the line it leaves is the one it meant to write');
+
+    // IDEMPOTENT. Running it twice must not produce a different file the
+    // second time, or "run it until it settles" becomes a real instruction.
+    eq(planStampWrite(realSw).next, plan.next, 'planning the same write twice plans the same bytes');
+
+    // --- and now every way it must refuse ------------------------------------
+    //
+    // Each of these is a state in which the writer would otherwise paste a
+    // confident-looking twelve characters over the deploy blocker, and the
+    // checker would then agree with it. A wrong stamp is strictly worse than a
+    // stale one: stale is caught on the next run, wrong is never caught again.
+    const refusals = [
+      ['sw.js does not parse',
+        { ...realSw, error: new Error('Unexpected token') }, /does not parse/],
+      ['SHELL comes back empty',
+        { ...realSw, SHELL: [] }, /no usable SHELL/],
+      ['SHELL is not an array at all',
+        { ...realSw, SHELL: null }, /no usable SHELL/],
+      // The one that matters most. A rename that misses this list leaves paths
+      // that read perfectly well and hash to nothing, and the digest of the
+      // remaining files is a real number that is not the right number.
+      ['a file in SHELL is not on disk',
+        { ...realSw, SHELL: [...realSw.SHELL, './js/does-not-exist.js'] }, /could not be read/],
+      ['the sweep is too small to be the shell',
+        { ...realSw, SHELL: ['./index.html', './css/app.css'] }, /only 2 files/],
+      // Two anchors means the file is not shaped the way the writer assumes,
+      // and "edit the first one" is a guess. Built by duplicating the real
+      // line rather than by writing a second one out, so it stays a duplicate.
+      // These two match on `^found N ` rather than on the full refusal text,
+      // and that is about the MUTATION HARNESS rather than about the writer.
+      // scripts/_mutate-fixes.mjs decides which failure line to report by
+      // stepping over anything matching /SHELL_STAMP/ — every mutation makes
+      // the stamp stale, so that line is noise in sixty rows out of sixty. A
+      // failure message here that quoted the token verbatim would be swept up
+      // by that filter and scored as "only the stamp moved", i.e. as a
+      // mutation nothing caught. The assertion still checks the real string;
+      // it just does not repeat the word in its own name.
+      ['sw.js carries two stamp declarations',
+        { ...realSw, src: realSw.src.replace(STAMP_ANCHOR, (m) => `${m}\n${m}`) }, /^found 2 /],
+      ['sw.js carries none the writer recognises',
+        { ...realSw, src: realSw.src.replace(STAMP_ANCHOR, 'const SHELL_STAMP = shellStamp();') },
+        /^found 0 /],
+    ];
+
+    for (const [what, broken, why] of refusals) {
+      const got = planStampWrite(broken);
+      ok(typeof got.refuse === 'string' && why.test(got.refuse),
+        `the stamp writer refuses when ${what} — expected /${why.source}/, got ${JSON.stringify(got.refuse)}`);
+      // AND THE REFUSAL IS THE WHOLE ANSWER. A reason string beside a usable
+      // `next` is a writer that explains itself and then does it anyway, which
+      // is the failure mode a caller reading only one field would never see.
+      //
+      // ok() AND NOT eq(), which is not a style preference. eq() prints the
+      // value it got, and the value here would be an entire copy of sw.js:
+      // unreadable on its own terms, and — because that copy contains the
+      // string SHELL_STAMP — swept up by the mutation harness's noise filter,
+      // which steps over stamp failures because every mutation causes one.
+      // The row for this assertion came back ONLY THE STAMP, scoring a caught
+      // mutation as an uncaught one, while the assertion underneath it was
+      // firing exactly as intended. An assertion message is read by tooling as
+      // well as by people.
+      ok(got.next === null, `and produces no replacement text when ${what}`);
+    }
+
+    // Nothing above touched the disk — the point of planning separately from
+    // writing — so say so rather than leaving it to be inferred.
+    eq(loadSwConsts().SHELL_STAMP, SHELL_STAMP,
+      'and none of that moved the stamp in the actual file');
+  }
+
+  // --- and the writer cannot be smuggled into the check ---------------------
+  //
+  // THE ONE WAY THE ABOVE CAN BE MADE MEANINGLESS. --write-stamp gives this
+  // file permission to edit sw.js, and the assertion three lines up is the
+  // thing it is allowed to edit its way out of. Those two facts are safe apart
+  // and dangerous together, and the only thing keeping them apart is that
+  // nobody runs the writer as part of the check.
+  //
+  // "Nobody does that today" is a property of the callers, not of the code —
+  // the same sentence that preceded half the findings in this repository. The
+  // realistic version is not malice: it is a green suite on a machine where
+  // the stamp keeps going stale, somebody appends the flag to the test script
+  // to stop the noise, and from then on every run repairs the deploy blocker
+  // it was written to catch and reports 121,000 passes while doing it. There
+  // would be no failing test, because the test would have been fixed.
+  //
+  // So the fence is asserted, not just described in the comment beside it.
+  // Checking process.argv here would prove nothing — this line only runs on
+  // the branch where the flag was absent. What has to be checked is the
+  // COMMAND, which is the thing a future reader would actually edit.
+  {
+    const pkg = JSON.parse(readRepo('package.json'));
+    const scripts = pkg.scripts || {};
+
+    ok(typeof scripts.test === 'string' && scripts.test.includes('test-engine.mjs'),
+      'package.json still runs the suite from npm test');
+    ok(!/--write-stamp/.test(scripts.test || ''),
+      'and npm test does NOT pass --write-stamp — the runner cannot rewrite the stamp it is checking');
+
+    // The writer needs a way in of its own, or the pressure to put it in the
+    // test script comes straight back. Derived from the flag string rather
+    // than from a copy of the whole command: what matters is that some script
+    // offers it and that it is not the one CI runs.
+    const offering = Object.entries(scripts).filter(([, cmd]) => /--write-stamp/.test(cmd));
+    eq(offering.length, 1, 'exactly one npm script offers --write-stamp');
+    ok(offering.length === 1 && offering[0][0] !== 'test',
+      `and it is not the test script — it is npm run ${offering.length === 1 ? offering[0][0] : '?'}`);
+
+    // The failure message above tells the reader to run it by that name, so
+    // the name is part of the contract and not a detail of package.json.
+    ok(Object.prototype.hasOwnProperty.call(scripts, 'stamp'),
+      'the script is called "stamp", which is what the stale-stamp failure tells you to run');
   }
 
   // --- where the worker lives, as stated in prose ---------------------------
@@ -9228,27 +11347,129 @@ section('The seams: two files, one string, and nothing enforcing it');
     }
     eq(unguarded.length, 0, 'every transport handler refuses to act for a session that has ended');
 
-    // BY NAME, not by count. net.js decides which handlers exist, so a count
-    // tuned to today's number still passes on the day somebody adds one and
-    // forgets the guard — which is the exact failure being prevented.
+    // BY NAME, not by count. A count tuned to today's number still passes on
+    // the day somebody adds a handler and forgets the guard — which is the
+    // exact failure being prevented.
     //
     // A count is also unreadable when it is wrong. The first version of this
     // check asserted `guarded >= 16` and printed a hard-coded 16 in the
     // summary line; the scanner was in fact finding 17 the whole time, and
     // there was no way to tell the two apart from the output. Naming them
     // costs two lines and makes the summary say what was actually examined.
-    const HOST_HANDLERS = ['onOpen', 'onConnect', 'onJoin', 'onData', 'onDisconnect',
-      'onError', 'onBrokerDown', 'onBrokerUp', 'onBrokerLost'];
-    const CLIENT_HANDLERS = ['onOpen', 'onState', 'onData', 'onClose',
-      'onError', 'onBrokerDown', 'onBrokerUp', 'onBrokerLost'];
+    //
+    // -----------------------------------------------------------------------
+    // AND THE NAMES ARE READ OUT OF js/net.js RATHER THAN WRITTEN DOWN HERE
+    // -----------------------------------------------------------------------
+    // They were written down here, and they were right: nine host names and
+    // nine client names, matching net.js exactly. Right by hand, though, with
+    // nothing holding them there — and the paragraph above had already made
+    // the argument ("net.js decides which handlers exist") before going on to
+    // hard-code the names net.js decided on that afternoon.
+    //
+    // The hole that leaves is specific, and it is not the one the guard check
+    // closes. The scanner above only inspects handlers it FINDS in main.js, so
+    // a handler main.js never wires at all is invisible to it. This list is
+    // what is supposed to notice the absence — and a list cannot notice a name
+    // it does not contain. Add onFoo to net.js, wire it nowhere, and the suite
+    // stays green over a callback firing into nothing.
+    //
+    // THE SOURCE OF TRUTH IS THE CALL, NOT THE DOC BLOCK. net.js sets out both
+    // handler sets in prose above createHost and joinHost, and parsing that
+    // would be less code than what follows. It would also just move the
+    // hand-written list into the other file, where a doc comment drifts from
+    // the code in precisely the way this list did. `handlers.onX(...)` cannot
+    // drift, because it IS the call: if it is reachable, the handler can fire.
+    const netFlat = readRepo('js/net.js')
+      .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+    // The body of a named function. NOT balanced() above — that takes the
+    // first `{` after the needle, and every function in play here is declared
+    // `(handlers = {})`, so it would return the default value as the body and
+    // every set would come back empty. Walk the parameter list to its closing
+    // paren first, then find the brace.
+    const funcBody = (src, name) => {
+      const at = src.search(new RegExp(`function\\s+${name}\\s*\\(`));
+      if (at === -1) return null;
+      let i = src.indexOf('(', at), d = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === '(') d++;
+        else if (src[i] === ')' && --d === 0) { i++; break; }
+      }
+      const open = src.indexOf('{', i);
+      if (open === -1) return null;
+      d = 0;
+      for (let j = open; j < src.length; j++) {
+        if (src[j] === '{') d++;
+        else if (src[j] === '}' && --d === 0) return src.slice(open + 1, j);
+      }
+      return null;
+    };
+    const fires = (body) => new Set([...(body || '')
+      .matchAll(/handlers\.(on[A-Z]\w*)\s*\(/g)].map((m) => m[1]));
+
+    // ONE LEVEL OF CALL GRAPH, because four of the nine are not in either
+    // entry point. onBrokerUp/Down/Lost fire inside attachBrokerRecovery and
+    // onError's no-transport path fires inside inertTransport; both roles call
+    // both helpers, and neither helper's names appear in createHost or
+    // joinHost directly. A helper can only fire what it is handed, so the ones
+    // worth following are exactly those called with `handlers` as an argument
+    // — which is also why this needs no recursion or import graph: the set of
+    // functions that can reach a caller's handler is the set that is given it.
+    const roleHandlers = (entry) => {
+      const body = funcBody(netFlat, entry);
+      if (body === null) throw new Error(`net.js: could not find ${entry}()`);
+      const names = fires(body);
+      for (const m of body.matchAll(/\b([a-z]\w*)\s*\([^)]*\bhandlers\b/g)) {
+        const helper = funcBody(netFlat, m[1]);
+        if (helper) for (const n of fires(helper)) names.add(n);
+      }
+      return [...names].sort();
+    };
+    const HOST_HANDLERS = roleHandlers('createHost');
+    const CLIENT_HANDLERS = roleHandlers('joinHost');
+
+    // A SCAN THAT QUIETLY FINDS NOTHING MAKES EVERY ASSERTION BELOW VACUOUS,
+    // so a broken parse stops the run instead of passing it. Same reasoning as
+    // SCREENS at the top of this file: a derived list is only worth more than
+    // a typed one while the derivation is known to be working, and `0 of 0
+    // handlers were checked` is a green suite that has tested nothing.
+    if (HOST_HANDLERS.length < 8 || CLIENT_HANDLERS.length < 8) {
+      throw new Error('net.js handler scan found '
+        + `${HOST_HANDLERS.length} host and ${CLIENT_HANDLERS.length} client handlers`);
+    }
+    // onReplaced needs the guard more than most of these, not less. It is the
+    // only handler whose body calls teardown() itself, so an unguarded one
+    // running late would bump the epoch a second time and tear down whatever
+    // session had started since. Asserted by name because the derivation
+    // cannot know that one of the names it finds matters more than the others.
+    ok(CLIENT_HANDLERS.includes('onReplaced'),
+      'onReplaced is among the client handlers the scan found — the one that tears down from inside');
+
     for (const [role, names] of [['host', HOST_HANDLERS], ['client', CLIENT_HANDLERS]]) {
       for (const want of names) {
         ok(seen.includes(`${role}.${want}`),
-          `${role}.${want} was found by the scanner and checked — not silently skipped`);
+          `${role}.${want} — js/net.js can fire it, so js/main.js wires it and the scanner checked it`);
       }
     }
+
+    // AND THE OTHER DIRECTION. The loop above is satisfied by a main.js that
+    // wires twenty handlers so long as the right nine are among them, and a
+    // handler net.js never calls is dead code wearing a live name — nothing
+    // distinguishes it from the real ones when read, and it will be maintained
+    // as though it fires. Before the lists were derived this direction was an
+    // equality on the total, which caught a spurious handler only when it was
+    // not offset by a missing one.
+    const offered = new Set([
+      ...HOST_HANDLERS.map((n) => `host.${n}`),
+      ...CLIENT_HANDLERS.map((n) => `client.${n}`),
+    ]);
+    const orphans = seen.filter((s) => !offered.has(s));
+    for (const o of orphans) {
+      console.error(`  ✗ FAIL: js/main.js wires ${o}, which js/net.js never calls`);
+    }
+    eq(orphans.length, 0, 'and js/main.js wires no transport handler that net.js cannot fire');
     eq(seen.length, HOST_HANDLERS.length + CLIENT_HANDLERS.length,
-      `all ${HOST_HANDLERS.length + CLIENT_HANDLERS.length} transport handlers were seen, and every one is guarded`);
+      `all ${HOST_HANDLERS.length + CLIENT_HANDLERS.length} transport handlers net.js offers were seen, and every one is guarded`);
     guardedNames = seen;
 
     // The counter those guards read has to actually move, and it has to move
@@ -9262,6 +11483,62 @@ section('The seams: two files, one string, and nothing enforcing it');
     const sr = balanced(mainFlat, 'function scheduleReconnect(');
     ok(sr !== null && /epoch\s*!==\s*netEpoch/.test(sr || ''),
       'the reconnect timer checks the epoch before it re-dials — clearTimeout is not enough on its own');
+
+    // --- and the order of the two lines that retire a superseded tab -------
+    //
+    // THE ONLY PLACE THIS ORDERING IS ENFORCED. The live transport test for
+    // the second tab builds its own host, because liveTable's does not retire
+    // anything — so it asserts against a COPY of this handler, and a copy
+    // agrees with itself forever. What follows is the part that checks the
+    // copy is still describing main.js.
+    //
+    // Both statements are required and the order is the whole fix: a close
+    // that arrives with no explanation is indistinguishable from a channel
+    // that died, and the other end will redial, reclaim, and send the tab
+    // that just took the seat the same close. Swap these two lines and the
+    // frame is sent on a connection that is already shut — trySend() eats
+    // the InvalidStateError, nothing throws, nothing is logged, and the loop
+    // is back with a passing suite.
+    const oj = balanced(mainFlat, 'onJoin: (playerId, hello) =>');
+    ok(oj !== null, 'the host onJoin handler was found to check');
+    if (oj) {
+      const farewell = oj.indexOf('replacedFrame()');
+      const retire = oj.indexOf('dropConnection(stale)');
+      ok(farewell !== -1, 'onJoin tells a superseded connection why before it goes');
+      ok(retire !== -1, 'and still retires it, so the host is not left holding two channels for one player');
+      ok(farewell !== -1 && retire !== -1 && farewell < retire,
+        'and it says so BEFORE closing the channel it is saying it on, which is the entire fix');
+    }
+    ok(/replacedFrame/.test(readRepo('js/main.js').slice(0, 4000)),
+      'main.js imports the builder rather than writing the type string itself');
+
+    // --- and the other half of it, on the receiving side -------------------
+    //
+    // THE SESSION RECORD IS SHARED BY EVERY TAB ON THE ORIGIN, which is the
+    // same fact that causes this bug in the first place: one localStorage,
+    // one ticket, two tabs. So the tab that just LOST the seat must not tidy
+    // up after itself. The record it would delete was written moments ago by
+    // the tab that WON, and deleting it means THAT tab cannot resume after a
+    // reload. The cost of leaving it is this tab pulling the seat back over
+    // once if the player reloads here, which settles immediately, because the
+    // other tab then lands on this same screen in turn.
+    //
+    // Checked at the source, and it has to be: the live transport test above
+    // runs against a model of this handler, and a model has no localStorage
+    // to clobber, so no behavioural test in this suite can see the
+    // difference. This is also exactly the edit a tidy-up pass would make —
+    // clearSession() is right on the other three terminal screens — and
+    // until this assertion the only thing standing in its way was a comment.
+    const orp = balanced(mainFlat, 'onReplaced: () =>');
+    ok(orp !== null, 'the client onReplaced handler was found to check');
+    if (orp) {
+      ok(orp.includes('teardown()'),
+        'onReplaced tears the session down itself rather than letting the close that follows do it');
+      ok(!orp.includes('clearSession'),
+        'and does NOT clear the stored session — that record belongs to the tab that took the seat');
+      ok(/app\.screen\s*=\s*'replaced'/.test(orp),
+        'and lands on the screen that names the cause, rather than the generic error');
+    }
 
     // --- and the amplifier, which lives in the same handler ----------------
     //

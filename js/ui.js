@@ -14,7 +14,8 @@
 // js/main.js does not exist yet (it lands with the transport), so this is the
 // shape it will have to satisfy, written down where the consumer lives:
 //
-//   screen    'home' | 'join' | 'connecting' | 'error' | 'hostleft' | 'game'
+//   screen    'home' | 'join' | 'connecting' | 'error' | 'hostleft'
+//             | 'replaced' | 'game'
 //   me        { name }                    what this device calls itself
 //   code      'ABCD' | ''                 the room code, for display and copy
 //   pub       publicState() | null        from js/state.js, verbatim
@@ -97,6 +98,7 @@ export function render(root, app, intents) {
     case 'connecting': node = connectingScreen(app, intents); break;
     case 'error':      node = errorScreen(app, intents); break;
     case 'hostleft':   node = hostLeftScreen(app, intents); break;
+    case 'replaced':   node = replacedScreen(app, intents); break;
     case 'game':       node = gameScreen(app, intents); break;
     default:           node = homeScreen(app, intents);
   }
@@ -296,6 +298,32 @@ function hostLeftScreen(app, intents) {
       // There is nothing to rejoin, and saying so is kinder than a retry
       // button that can never succeed.
       el('p', {}, 'The game ran on the host’s phone, so it has gone with them. Thanks for playing.'),
+      backRow('‹ BACK HOME', intents.goHome),
+    ),
+    liveRegion(app.announce),
+  );
+}
+
+/**
+ * The seat went to another tab on this same device.
+ *
+ * SIBLING OF hostLeftScreen, NOT A VARIANT OF IT, and for the same reason it
+ * exists at all: both are terminal, and the thing that makes them terminal is
+ * that there is nothing useful to press. A "RECONNECT" button here would be a
+ * button whose entire effect is to take the seat off the tab that currently
+ * has it and hand this one the same screen — the loop the whole fix is about,
+ * with a finger on it. So there is one action and it goes home.
+ *
+ * The wording names the cause rather than the symptom. "Disconnected" is true
+ * and useless; somebody who does not know they have two tabs open cannot act
+ * on it, and somebody who does will close one.
+ */
+function replacedScreen(app, intents) {
+  return shell(
+    wordmark(intents),
+    el('div', { class: 'panel' },
+      el('h2', {}, 'Open in another tab'),
+      el('p', {}, 'This table is open in a newer tab on this device, and your seat went with it. You can close this one.'),
       backRow('‹ BACK HOME', intents.goHome),
     ),
     liveRegion(app.announce),
@@ -562,12 +590,36 @@ function revealScreen(app, intents) {
 /**
  * A seat's standing against its own bid: 'under', 'exact', 'over', or 'nobid'.
  *
- * THREE STATES, AND js/bot.js HAS TWO. appetite() in the bot answers 'duck' for
+ * FOUR STATES, AND js/bot.js HAS TWO. appetite() in the bot answers 'duck' for
  * both exact and over, and it is right to: for the purpose of choosing a card
  * they mean the same thing, which is stop winning tricks. For the purpose of
  * looking at a table they are triumph and disaster and must never be
  * confusable. So the duplication is deliberate and this is not a missing
- * import.
+ * import. ('nobid' never reaches the bot — a bot that is choosing a card has
+ * already bid.)
+ *
+ * ---------------------------------------------------------------------------
+ * A BID OF ZERO READS AS 'exact' THE MOMENT IT IS MADE, AND THAT IS INTENDED.
+ * ---------------------------------------------------------------------------
+ * seatState(0, 0) is 'exact', so a seat that bids nil takes the accent border
+ * and tint during BIDDING, before a card has been played. That looks at first
+ * like a phase bug — the glow that elsewhere means "they have got there" is
+ * showing up before anyone could have got anywhere.
+ *
+ * It is not. A seat on 0 tricks against a bid of 0 genuinely IS exact, in
+ * bidding as much as in play. The strip is telling the truth, and a nil bidder
+ * IS in the position the accent describes: holding what they asked for, with
+ * everything to lose. Suppressing it would mean the highlight appears later
+ * for a reason the player cannot see.
+ *
+ * The alternative costs more than it buys. Treating bidding as a special case
+ * needs a FIFTH visual state — 'nobid' cannot be borrowed for it, because that
+ * means the seat has not bid at all and this seat has — plus a phase argument,
+ * and this function is currently pure and phase-blind. Those are two
+ * properties the exhaustive sweep in scripts/test-engine.mjs depends on: a
+ * phase-dependent seatState is a seam between this file and whichever caller
+ * knows the phase, which is exactly the kind of place the bugs in this repo
+ * have lived.
  *
  * Exported because it is the whole visual language of the strip and the pad,
  * and a pure two-argument function is something a test can sweep exhaustively.
@@ -770,10 +822,18 @@ function totalsRow(app, intents) {
  * One card face. Ivory on dark felt, reused from sequence, because a rank has
  * to be legible in a small cell on a phone and a dark card is not.
  *
- * Sized by `flex: 1 1 0` with a `max-width` in the stylesheet rather than by a
- * width computed here. That is what makes one card render as one normal-sized
- * card instead of stretching across the dock, and ten cards shrink to 30px
- * without overflowing — measured, both of them, in _sketch.html.
+ * Sized by the stylesheet rather than by a width computed here: .hand in
+ * css/app.css gives the face a clamped width and an aspect-ratio, and wraps
+ * the row when the cards would go below the floor.
+ *
+ * This comment used to say the sizing was `flex: 1 1 0` with a `max-width`,
+ * and that ten cards shrank to 30px "without overflowing — measured, both of
+ * them". Both halves were true and the conclusion was still wrong: it had
+ * measured one hand size and a legal hand goes to seventeen, where the same
+ * rule gave a 13.2px card carrying a 19.8px "10". A measurement of the case
+ * you thought of is not a measurement of the range. The sweep now runs every
+ * legal hand size at every phone width, and it lives in the suite rather than
+ * in a scratch file that can be deleted without anything noticing.
  */
 function cardFace(code, { big = false, cls = '' } = {}) {
   return el('span', { class: `card${isRedCard(code) ? ' red' : ''}${big ? ' big' : ''} ${cls}` },
@@ -955,12 +1015,26 @@ function bidPad(app, intents) {
 // During bidding the hand is for LOOKING AT. No card is selectable, because
 // selecting one would do nothing and a control that does nothing is worse than
 // no control. Same faces, same order, no buttons.
+//
+// And because nothing here is a tap target, the cards can OVERLAP — which is
+// the `fan` class. On the play screen every card needs a finger-sized area of
+// its own, so the row wraps and a 17-card hand costs three rows of dock; here
+// only the corner of each card has to be readable, so the whole hand fans
+// across one row at any size. That is 113px of dock instead of 232px, and on
+// this screen the dock is competing with a bid pad that grows with the hand,
+// so those 119px are the difference between seeing the pad and scrolling for
+// it. The measurement is in _bidfit.html.
+//
+// The class is spelled out rather than left to a `:has(.card-btn.static)`
+// selector in the stylesheet: the seam check in scripts/test-engine.mjs pairs
+// every class this file emits against a rule in app.css, and a :has() hook is
+// invisible to that pairing — it would style a screen that no test could see.
 function biddingHand(app) {
   const { priv } = app;
   if (!priv) return null;
   return el('div', { class: 'hand-dock' },
     el('p', { class: 'turn-hint mine' }, 'Your hand this round'),
-    el('div', { class: 'hand' }, priv.hand.map((c) => el('span', {
+    el('div', { class: 'hand fan' }, priv.hand.map((c) => el('span', {
       class: 'card-btn static', 'aria-label': cardName(c.code),
     }, cardFace(c.code)))),
   );

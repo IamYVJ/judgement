@@ -48,7 +48,8 @@ import { createBotDriver } from './bot.js';
 import { PRESETS } from './rules.js';
 import {
   createHost, joinHost, HOST_ID, WIRE,
-  rejectFrame, readRejectFrame, peerAvailable, describePeerError, isFatalPeerError,
+  rejectFrame, readRejectFrame, replacedFrame,
+  peerAvailable, describePeerError, isFatalPeerError,
 } from './net.js';
 import {
   clientId, loadName, saveName, loadCode, saveCode,
@@ -435,7 +436,20 @@ function beginHost(code, resumed = null) {
       const r = engine.addPlayer(playerId, hello.name, { clientId: hello.clientId });
       if (!r.ok) { host.sendTo(playerId, rejectFrame(r.error)); return; }
 
-      if (stale) host.dropConnection(stale);
+      if (stale) {
+        // TELL IT WHY, THEN RETIRE IT — in that order, and the order is the
+        // whole fix. A bare close is what a tunnel looks like, so the other
+        // end redials, reclaims the seat from the connection that just took
+        // it, and the two of them trade the chair back and forth forever.
+        // That is not hypothetical: two tabs of the same browser share a
+        // localStorage and therefore share a ticket, which is all it takes.
+        //
+        // Best-effort on purpose. If the frame is lost in flight the old
+        // behaviour is what happens, so nothing depends on it arriving; see
+        // the note above WIRE in js/net.js.
+        host.sendTo(stale, replacedFrame());
+        host.dropConnection(stale);
+      }
       // A seat coming back mid-pause should not inherit the absent-player
       // countdown that was running against it.
       if (bots) bots.reset();
@@ -604,6 +618,36 @@ function beginJoin(code, resuming = false) {
       app.busy = false;
       app.selected = null;
       app.selectedBid = null;
+      paint();
+    },
+
+    // THE HOST HAS GIVEN OUR SEAT TO ANOTHER CONNECTION HOLDING OUR TICKET,
+    // and a ticket is per-device, not per-tab. This is a second tab of the
+    // same browser, or the same page opened twice.
+    //
+    // The close that follows is a millisecond away and would otherwise start
+    // the reconnect ladder, which would win the seat back, which would send
+    // this same frame to the tab that just took it. Two tabs will do that to
+    // each other indefinitely, showing nothing but a spinner each.
+    //
+    // teardown() is what stops it, and it is reused here rather than a new
+    // flag because it already does the exact thing needed: netEpoch++ makes
+    // every callback still in flight — including that onClose — a no-op, and
+    // it cancels the ladder rather than merely declining to extend it. It
+    // also clears app.reconnecting, so the banner does not survive onto this
+    // screen and there is nothing to clear again here — a second assignment
+    // would only suggest to the next reader that teardown might not have.
+    onReplaced: () => {
+      if (!live()) return;
+      teardown();
+      app.screen = 'replaced';
+      // NOT clearSession(), and this is the trap. localStorage is shared by
+      // every tab on the origin, so the record this would delete is the one
+      // the tab that just took the seat wrote a moment ago — and deleting it
+      // means THAT tab cannot resume after a reload. Leaving it costs a
+      // reload of this tab pulling the seat back over once, which is a thing
+      // the player explicitly did and which settles immediately, because the
+      // other tab then lands on this screen in turn.
       paint();
     },
 

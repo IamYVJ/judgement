@@ -1,20 +1,79 @@
 # Scratch work, not the project.
 #
-# Everything here is a THROWAWAY: one-shot probes written to answer one
-# question, mutation tables written to prove the suite bites, and their
-# captured output. They are kept rather than deleted because re-proving a
-# check next time is cheaper than rewriting the table that proves it — but
-# they are not part of the build, nobody should have to read them, and they
-# must never reach a commit.
+# Everything here is UNSHIPPED: one-shot probes written to answer one
+# question, mutation tables written to prove the suite bites, their captured
+# output, and the UI sketches the build was designed against. Not part of the
+# build, not something anybody should have to read, and they must never reach
+# a commit.
 #
 # The convention is the leading underscore, and it is the whole rule: a file
-# named _anything is scratch. Everything without one is the project.
+# named _anything is scratch. Everything without one is the project. That rule
+# is currently TOTAL rather than merely broad — every file on disk is either
+# tracked or matched here, nothing falls between — and the one-line check for
+# it is at the bottom of this file.
+#
+# ---------------------------------------------------------------------------
+# UNSHIPPED IS NOT THE SAME AS DISPOSABLE. DO NOT BULK-DELETE BY THE PATTERN.
+# ---------------------------------------------------------------------------
+# The underscore says "git does not carry this". It does not say "nobody needs
+# this", and reading it as though it did is the mistake this paragraph exists
+# to stop. Two of these files are load-bearing right now:
+#
+#   scripts/_mutate-fixes.mjs   THE LIVE MUTATION TABLE. Every fix from the
+#                               audit list has rows in it, and it is how each
+#                               one was shown to be caught rather than merely
+#                               made to pass. Run before touching js/. Deleting
+#                               it throws away the evidence for the whole list
+#                               and there is no command that rebuilds it.
+#
+#   _sketch.html                Named in a comment inside itself at :719, which
+#   scripts/_sketchcheck.mjs    runs its layout block headless. The pair is a
+#                               cross-reference, so deleting one strands the
+#                               other's explanation.
+#
+# The rest divide by what losing them would actually cost. The one-shot probes
+# each answered a question that is now an assertion in scripts/test-engine.mjs,
+# so they are cheap to lose and cheap to rewrite. The per-checkpoint mutation
+# tables (_mutate-bot, _mutate-net, _mutate-shell, _mutate-ui, _mutate) are the
+# expensive ones: they cover ground _mutate-fixes.mjs does not, and rewriting
+# one is hours, not minutes.
+#
+# Keeping the scripts costs ~190kB that git never sees. That is the entire
+# downside, and it is smaller than re-deriving any one of them.
+#
+# CAPTURED OUTPUT IS THE EXCEPTION, AND IT IS DELETED ON SIGHT. Redirected run
+# logs — .out, .progress, .log — are not artefacts, they are a transcript of
+# one execution of something that is still on disk and still runnable. Every
+# line of a .out can be reproduced by re-running the table that printed it,
+# which is the test for whether a file belongs in the paragraph above: if a
+# command rebuilds it, keeping it buys nothing and costs a stale copy.
+#
+# The stale copy is the actual hazard, not the bytes. A _mutate-fixes.out sat
+# here from a run four days older than the table beside it, and a capture that
+# no longer matches what the harness prints is worse than no capture at all —
+# it reads as evidence, and it is evidence for a version of the code that no
+# longer exists. Nothing reads these files; they exist only to be glanced at.
+# Glance, then delete.
+#
+# So: none are checked in here now, and none should accumulate. If you want a
+# run kept, keep it somewhere it will be read, with the date and the commit it
+# describes — not as a bare .out next to the script that outgrew it.
 #
 # NOT ignored, and deliberately so:
 #   scripts/test-engine.mjs   the suite itself
 #   scripts/domshim.mjs       the DOM the suite renders into, headless
 #   scripts/peershim.mjs      the transport the suite talks over, headless
 #   scripts/gen-icons.js      generates icons/, which ships
+#
+# That list is hand-written, so treat it as a description and not as the
+# enforcement — a fifth keeper added to scripts/ will not appear in it on its
+# own. What IS checkable is that nothing has fallen through the gap:
+#
+#     git ls-files --others --exclude-standard     # must print nothing
+#
+# Empty means every file on disk is either tracked or deliberately ignored. A
+# line of output is either a new project file nobody staged or scratch work
+# missing its underscore, and the two look identical until somebody commits.
 _*
 
 # ...but the shipped page is index.html, and no underscore file is loaded by

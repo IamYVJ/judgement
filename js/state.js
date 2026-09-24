@@ -106,6 +106,55 @@ export const TRICK_PAUSE_MS = 1400;
 // wire every time anybody played a card.
 const LOG_CAP = 60;
 
+/**
+ * Seal a completed round record: copied and frozen all the way down, so that
+ * nothing reachable through it is either shared with the caller or writable.
+ *
+ * THE ONLY PLACE A ROUND RECORD IS SEALED. Both paths come here — _endRound()
+ * when a round finishes, restore() when a snapshot is adopted — and that is
+ * the point rather than a convenience. Sealing used to be written twice: a
+ * hand-listed `Object.freeze` per field where records are born, and this
+ * generic pass where they are restored. Two implementations of one invariant
+ * agree until they do not, and the way they stop agreeing is a field added in
+ * one place and not the other — after which a fresh engine and a restored
+ * engine hand out records with different guarantees, from the same match.
+ *
+ * WHY IT TAKES NO LIST OF FIELDS. The obvious version names bids, tricks,
+ * deltas and totals, and the obvious version is wrong the first time a fifth
+ * field is added — because fields are added where records are BUILT and not
+ * where they are sealed, and a record that is frozen except for one live array
+ * is the exact bug this function exists to close. A rule cannot be left out of
+ * date; a list can.
+ *
+ * WHY IT RECURSES. Object.freeze is shallow and so was this: it reached one
+ * level, which covered every field a record has ever had, because every one of
+ * them is an array of numbers. "Every field it has today" is a property of the
+ * records, not of this function — the same thing that was wrong about
+ * restore() adopting the caller's arrays. A record that grew a nested object
+ * would be sealed at the top, handed out through publicState(), and quietly
+ * writable one dot further in. Going all the way down costs a few hundred
+ * bytes a match and removes the question.
+ *
+ * Only arrays and plain objects are descended into. Anything else is passed
+ * through untouched, which is conservative and also a non-case: a round record
+ * is JSON by construction — it goes on the wire and into localStorage — so it
+ * has no class instances and, importantly for the recursion, no cycles.
+ *
+ * It COPIES rather than freezing in place, because freezing an object handed
+ * in by a caller mutates something that is not ours — restore() is given a
+ * snapshot the caller may still be holding, and turning it read-only under
+ * them is a surprise with no upside.
+ */
+function freezeRound(v) {
+  if (Array.isArray(v)) return Object.freeze(v.map((x) => freezeRound(x)));
+  if (!v || typeof v !== 'object') return v;
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return v;
+  const out = {};
+  for (const [k, val] of Object.entries(v)) out[k] = freezeRound(val);
+  return Object.freeze(out);
+}
+
 export class GameEngine {
   constructor() { this.reset(); }
 
@@ -712,15 +761,46 @@ export class GameEngine {
     // round twelve replays history and rebuilds the entire scoreboard from it,
     // without ever having seen rounds one to eleven. Storing only the deltas
     // would work too, right up until one arrived out of order.
-    this.history.push(Object.freeze({
+    //
+    // FROZEN TO THE ARRAYS, not just at the top. Object.freeze is shallow, and
+    // a record frozen at the top with four live arrays hanging off it is the
+    // shape that reads as safe and is not: publicState() hands these records
+    // straight out, so `pub.history[0].totals.sort()` — one line in a
+    // scoreboard, the most obvious thing in the world to write — was reaching
+    // through the public view and reordering the engine's own record of a
+    // round that is over. Nothing in the app does that today. The point is
+    // that the next thing to try it gets a TypeError instead of a wrong
+    // scoreboard three rounds later.
+    //
+    // Sealed here rather than copied in publicState() because the record is
+    // append-only and already immutable in spirit — nothing ever edits a
+    // finished round. Freezing says that once, at the only place a record is
+    // born; copying would say it on every push, about 900 times a match, and
+    // would swallow the mistake instead of reporting it.
+    //
+    // THE FIELD LIST BELOW IS THE RECORD, NOT THE SEAL. Every value goes in
+    // raw — no slice, no Object.freeze — because freezeRound() does both, to
+    // every field, at every depth. That is what makes this literal safe to
+    // extend: a fifth field added here is sealed by the same rule as the other
+    // four, and cannot be the one somebody forgot to wrap. It is also the only
+    // sealing code in the file, so a restored engine cannot end up with
+    // stronger or weaker records than this one.
+    //
+    // `this.bids`, `this.tricksWon` and `this.totals` are all live engine
+    // arrays and are handed over unsliced ON PURPOSE: freezeRound copies. If
+    // it ever stopped, the record would alias the arrays the next round is
+    // about to overwrite, and history would rewrite itself as the match went
+    // on — which is a far louder failure than a missing freeze, and that is
+    // the right way round.
+    this.history.push(freezeRound({
       roundIndex: this.roundIndex,
       roundSize: this.roundSize,
       trump: this.trump,
       dealerSeat: this.dealerSeat,
-      bids: this.bids.slice(),
-      tricks: this.tricksWon.slice(),
+      bids: this.bids,
+      tricks: this.tricksWon,
       deltas,
-      totals: this.totals.slice(),
+      totals: this.totals,
     }));
 
     for (const seat of this.bidOrder) {
@@ -806,8 +886,38 @@ export class GameEngine {
    * written to this.bids only once it is submitted and legal, so there is no
    * half-made bid anywhere in the engine for this function to leak.
    *
-   * Every array is copied. Handing out a live reference to this.totals means
-   * a consumer that sorts the scoreboard reorders the seats.
+   * ---------------------------------------------------------------------
+   * NOTHING REACHABLE FROM HERE CAN MOVE THE ENGINE, and it is worth being
+   * precise about how, because "every array is copied" is what this comment
+   * used to say and it was only two thirds true.
+   * ---------------------------------------------------------------------
+   *
+   * Three different mechanisms, one guarantee:
+   *
+   *   COPIED    seats, plan, plays, tricks, lastTrick, leaders. Rebuilt on
+   *             every call, so a consumer that sorts one is sorting its own.
+   *             plan is numbers, so slice() really is deep for it; plays and
+   *             tricks are copied two levels because a shallow slice hands
+   *             out live play records.
+   *
+   *   FROZEN    history and log. The ARRAY is sliced here; the RECORDS and
+   *             LINES inside it are frozen where they are written, in
+   *             _endRound() and _say(). That split is the whole subtlety —
+   *             pub.log is a copy but pub.log[0] is not, so before the
+   *             freeze a consumer editing a line edited the engine's line.
+   *             Frozen rather than copied because these are append-only and
+   *             immutable in spirit, so it can be said once at the write
+   *             site instead of ~900 times a match on the push path, and
+   *             because a mutation then throws instead of quietly diverging.
+   *
+   *   PRIMITIVE config. A LIVE reference — pub.config === this.config — and
+   *             safe only because normalizeConfig() in js/rules.js freezes
+   *             it and every value in it is a primitive, which makes that
+   *             shallow freeze a deep one. That is a guarantee owned by
+   *             another file, so the suite asserts it there rather than
+   *             trusting it here; delete the freeze in rules.js and this
+   *             becomes a hole in the privacy boundary with nothing at this
+   *             end to notice.
    */
   publicState() {
     return {
@@ -968,7 +1078,17 @@ export class GameEngine {
       tricks: this.tricks.map((t) => ({ plays: t.plays.map((p) => ({ ...p })), winner: t.winner })),
       leadSeat: this.leadSeat,
       turnSeat: this.turnSeat,
-      lastTrick: this.lastTrick,
+      // COPIED, like every other object on this list. It was the one field
+      // handed out live, and it did not show up as a bug because the shipped
+      // caller stringifies the result immediately — JSON copies everything,
+      // so the hole was invisible to the only path that uses it. The path
+      // that does NOT stringify is restore(other.serialize()), which is how
+      // the suite duplicates an engine, and there it handed two engines one
+      // trick record.
+      lastTrick: this.lastTrick ? {
+        ...this.lastTrick,
+        plays: this.lastTrick.plays.map((p) => ({ ...p })),
+      } : null,
       sweepAt: this.sweepAt,
       log: this.log.slice(),
     };
@@ -982,40 +1102,92 @@ export class GameEngine {
    * previous match left in it. Every field is then taken defensively: a
    * half-written localStorage entry should give a lobby, not a throw on load
    * that leaves the app with no UI at all.
+   *
+   * DEFENSIVE ABOUT TWO THINGS, and for a long time only one of them. Type is
+   * the obvious one and it is what every own() / Number() / ?? below reads
+   * as. The second is OWNERSHIP: the snapshot is the caller's object, and an
+   * engine that adopts its arrays writes into it for the rest of the match.
+   * Nothing here keeps a reference to anything it was handed — see own().
    */
   restore(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return { ok: false, error: 'no snapshot' };
     this.reset();
     const s = snapshot;
-    const arr = (v) => (Array.isArray(v) ? v : []);
+
+    // EVERY ARRAY IS COPIED ON THE WAY IN. The type check is the part of this
+    // helper you notice; the slice is the part that matters.
+    //
+    // What restore() is handed belongs to the CALLER. It is the object
+    // js/main.js read out of localStorage, and adopting it makes the engine
+    // and that object one thing — so `this.tricksWon[winner] += 1`, which
+    // runs a few hundred times a match, writes into the snapshot somebody
+    // else is still holding. Restore two engines from one snapshot and they
+    // share a `totals`: the second match scores into the first. Nothing in
+    // the app does that today, and "nothing does that today" is not a
+    // property of this function, it is a property of its one caller.
+    //
+    // A helper rather than twelve slices at twelve call sites, for the same
+    // reason freezeRound takes no field list: the next field added here will
+    // be written by copying the line above it, so the line above it has to be
+    // right. Named `own` because that is the guarantee — after this call the
+    // array is the engine's, and no other reference reaches it.
+    const own = (v) => (Array.isArray(v) ? v.slice() : []);
 
     this.phase = Object.values(PHASES).includes(s.phase) ? s.phase : PHASES.LOBBY;
     this.phaseAt = Number(s.phaseAt) || 0;
     this.config = normalizeConfig(s.config);
     this.ownerId = s.ownerId ?? null;
-    this.seats = arr(s.seats).map((seat) => ({ ...seat }));
-    this.plan = arr(s.plan);
+    this.seats = own(s.seats).map((seat) => ({ ...seat }));
+    this.plan = own(s.plan);
     this.roundIndex = Number.isInteger(s.roundIndex) ? s.roundIndex : -1;
     this.dealerSeat = Number(s.dealerSeat) || 0;
-    this.totals = arr(s.totals);
-    this.history = arr(s.history);
+    this.totals = own(s.totals);
+    // RE-FROZEN ON THE WAY IN. A snapshot has been through JSON, and JSON has
+    // no idea what a frozen object is — every record and every array inside it
+    // comes back plain. Without this the immutability guarantee that _endRound
+    // and _say establish would hold for a match played straight through and
+    // silently lapse for one resumed from a reload, which is the worse of the
+    // two halves to lose: resume is exactly when history is longest and the
+    // scoreboard has the most to draw from it.
+    //
+    // freezeRound also copies, so this line de-aliases the records as well as
+    // sealing them — the same guarantee `own` gives every other field here,
+    // arrived at by a different route. Both are needed: own() copies the
+    // history ARRAY, freezeRound copies the records IN it.
+    this.history = own(s.history).map(freezeRound);
     this.roundSize = Number(s.roundSize) || 0;
     this.trump = s.trump ?? null;
     this.turnUpCard = s.turnUpCard ?? null;
     this.turnUpShown = s.turnUpShown === true;
-    this.hands = arr(s.hands).map((h) => arr(h));
-    this.stock = arr(s.stock);
-    this.bids = arr(s.bids);
-    this.bidOrder = arr(s.bidOrder);
-    this.tricksWon = arr(s.tricksWon);
+    // own() TWICE, because hands is an array of arrays and the inner one is
+    // the one that gets dealt into. The outer copy alone would leave seat
+    // three's hand shared with the snapshot.
+    this.hands = own(s.hands).map((h) => own(h));
+    this.stock = own(s.stock);
+    this.bids = own(s.bids);
+    this.bidOrder = own(s.bidOrder);
+    this.tricksWon = own(s.tricksWon);
     this.trickIndex = Number(s.trickIndex) || 0;
-    this.plays = arr(s.plays).map((p) => ({ ...p }));
-    this.tricks = arr(s.tricks).map((t) => ({ plays: arr(t && t.plays), winner: t && t.winner }));
+    this.plays = own(s.plays).map((p) => ({ ...p }));
+    // Rebuilt a level deeper than it looks: the record is new, its plays array
+    // is new, and so is every play in it — matching what serialize() and
+    // publicState() already do for the same shape.
+    this.tricks = own(s.tricks).map((t) => ({
+      plays: own(t && t.plays).map((p) => ({ ...p })),
+      winner: t && t.winner,
+    }));
     this.leadSeat = Number(s.leadSeat) || 0;
     this.turnSeat = Number(s.turnSeat) || 0;
-    this.lastTrick = s.lastTrick ?? null;
+    // The only object-valued field a snapshot carries whole, and the one place
+    // `own` cannot be the answer. Spread rather than naming plays/winner/card/
+    // trickIndex, so a fifth field added in _finishTrick survives a reload
+    // without anybody remembering this line. The `typeof` test is why garbage
+    // in the slot lands on null instead of being adopted as a trick record.
+    this.lastTrick = s.lastTrick && typeof s.lastTrick === 'object'
+      ? { ...s.lastTrick, plays: own(s.lastTrick.plays).map((p) => ({ ...p })) }
+      : null;
     this.sweepAt = s.sweepAt ?? null;
-    this.log = arr(s.log);
+    this.log = own(s.log).map((l) => Object.freeze({ ...l }));
 
     // Everyone is assumed gone until they say otherwise. A restored host has
     // no connections yet, and showing six green dots to a table of nobody is
@@ -1049,9 +1221,19 @@ export class GameEngine {
    * learns what trump is, who took the trick and what everybody scored from
    * exactly these sentences and nothing else. Written to be read aloud —
    * "Hearts are trumps", not "trump: H".
+   *
+   * FROZEN, for the same reason the history records are: publicState() slices
+   * this array but hands out the entries themselves, so an entry is reachable
+   * from every peer's copy of the public state. The array is a copy and the
+   * entry is not, which is the distinction that makes `pub.log.at(-1).text =
+   * ...` look local and be global. Nothing in the app writes to a log line —
+   * ui.js reads .text and .kind — and this is what keeps it that way.
+   *
+   * The array itself is still mutated below, deliberately. The cap is the
+   * engine's business and the frozen thing is the line, not the ledger.
    */
   _say(text, kind = 'system', seat = null) {
-    this.log.push({ text, kind, seat, round: this.roundIndex });
+    this.log.push(Object.freeze({ text, kind, seat, round: this.roundIndex }));
     if (this.log.length > LOG_CAP) this.log.splice(0, this.log.length - LOG_CAP);
   }
 }

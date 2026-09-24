@@ -73,11 +73,17 @@
 // so that a checkout on Windows and a checkout on Linux agree.
 //
 // scripts/test-engine.mjs recomputes it and fails if it does not match, and
-// the failure prints the value to paste. So the rule is no longer "remember to
-// bump this" — it is "the suite will tell you the new number". Note what is
-// NOT in SHELL and therefore not in the hash: sw.js itself. A worker does not
-// precache itself, which is also the only reason this can be computed at all.
-const SHELL_STAMP = '1b70d19f30ae';
+// `npm run stamp` rewrites this one line with the answer. So the rule is no
+// longer "remember to bump this" — it is "the suite tells you, and one command
+// does it". DO NOT EDIT THE TWELVE CHARACTERS BY HAND to make a red suite go
+// green: the number is a claim about the bytes of twenty-one other files, and
+// typing one that happens to match is the same as deleting the check.
+//
+// Note what is NOT in SHELL and therefore not in the hash: sw.js itself. A
+// worker does not precache itself, which is also the only reason this can be
+// computed at all — and the only reason `npm run stamp` can write to this file
+// without moving the target it just measured.
+const SHELL_STAMP = '097776891efe';
 
 // The stamp is the version. Keeping the 'judgement-shell-' prefix matters —
 // the activate handler below deletes caches by it, and deleting by prefix is
