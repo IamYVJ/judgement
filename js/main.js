@@ -47,13 +47,13 @@ import { applyGameIntent } from './intents.js';
 import { createBotDriver } from './bot.js';
 import { PRESETS } from './rules.js';
 import {
-  createHost, joinHost, HOST_ID, WIRE,
+  createHost, joinHost, HOST_ID, WIRE, WATCHER,
   rejectFrame, readRejectFrame, replacedFrame,
   peerAvailable, describePeerError, isFatalPeerError,
 } from './net.js';
 import {
   clientId, loadName, saveName, loadCode, saveCode,
-  normalizeCode, generateRoomCode, copyText, announcementFor,
+  normalizeCode, CODE_LENGTH, generateRoomCode, copyText, announcementFor,
   saveSession, loadSession, clearSession, saveEngineSnapshot, loadEngineSnapshot,
 } from './util.js';
 
@@ -74,6 +74,15 @@ const app = {
   pub: null,
   priv: null,
   isHost: false,
+  // A THIRD ROLE, and it is a separate flag rather than a third value of
+  // isHost for the same reason isHost and isOwner are separate: they answer
+  // different questions and a device can be none of them. isHost is "am I
+  // running the engine"; this is "did I ask for a seat". A watcher is neither
+  // host nor player, and the one thing every part of the app has to agree on
+  // is that it never gets a hand — so the flag is held here, where the
+  // reconnect ladder can see it, rather than inferred from app.screen, which
+  // the error screens overwrite.
+  watching: false,
   error: null,
   selected: null,
   selectedBid: null,
@@ -143,7 +152,13 @@ function draw() {
   // that goes stale the first time a phase is added. `.shell-play` is the class
   // the renderer itself puts on exactly the screens with a pinned strip and
   // dock, so it cannot disagree with itself.
-  document.body.classList.toggle('in-play', !!root.querySelector('.shell-play'));
+  //
+  // `.tv` joins it for the same reason and a stronger one: the TV view fills
+  // the screen edge to edge by design, and a footer under it would either
+  // shrink the board or put a scrollbar on a television. Two selectors rather
+  // than one because they are two different kinds of board, not because the
+  // second is a special case of the first.
+  document.body.classList.toggle('in-play', !!root.querySelector('.shell-play, .tv'));
 
   if (focusKey) {
     const next = root.querySelector(`[data-focus="${focusKey}"]`);
@@ -456,6 +471,22 @@ function beginHost(code, resumed = null) {
       push();
     },
 
+    onWatch: (playerId, accepted) => {
+      if (!live()) return;
+      // ACCEPTED NEEDS NOTHING DOING, and the asymmetry is worth a sentence
+      // because it looks like a missing branch. onConnect above already sent
+      // this connection the whole table the moment it opened, and pushState
+      // reaches it on every change after that — a watcher's seat index is −1,
+      // so stateFrameFor gives it `priv: null` without being asked. Sending
+      // the board again here would be a duplicate frame, not a fix.
+      //
+      // Refused is the case that needs an answer, because the alternative is
+      // a television showing a spinner forever with nothing to say why.
+      if (!accepted) {
+        host.sendTo(playerId, rejectFrame('This table already has as many screens watching as it can carry.'));
+      }
+    },
+
     onData: (playerId, msg) => {
       if (!live()) return;
       // EVERY inbound frame goes through here and nothing else. applyGameIntent
@@ -562,6 +593,16 @@ function clearJoinTimer() {
   if (joinTimer !== null) { clearTimeout(joinTimer); joinTimer = null; }
 }
 
+/** Whether this device is past the handshake and looking at a table — playing
+ *  at it or watching it. The distinction the broker handlers below care about
+ *  is "is there a DataConnection carrying the game", and once there is, the
+ *  broker is a detail the player must not be told about. A watcher is in that
+ *  position for exactly the same reason a player is, so the test is on both
+ *  screens rather than on 'game' alone. */
+function inRoom() {
+  return app.screen === 'game' || app.screen === 'watch';
+}
+
 /**
  * Dial a room.
  *
@@ -569,8 +610,13 @@ function clearJoinTimer() {
  * the controller can tell apart: a FIRST join that times out is an error
  * screen, while a RECONNECT that times out keeps the table on screen and tries
  * again. Same transport call, entirely different meaning.
+ *
+ * `watch` asks for the board and no seat. An OPTIONS OBJECT rather than a
+ * second positional boolean, because `beginJoin(code, true, false)` at a call
+ * site says nothing about which `true` is which, and the reconnect ladder is
+ * the one place that has to get both right.
  */
-function beginJoin(code, resuming = false) {
+function beginJoin(code, { resuming = false, watch = false } = {}) {
   if (!resuming) teardown();
   else if (client) { try { client.destroy(); } catch (_) {} client = null; }
 
@@ -582,6 +628,7 @@ function beginJoin(code, resuming = false) {
   const live = () => epoch === netEpoch;
 
   app.isHost = false;
+  app.watching = watch;
   app.code = code;
   if (!resuming) {
     app.screen = 'connecting';
@@ -599,11 +646,18 @@ function beginJoin(code, resuming = false) {
       if (!live()) return;
       clearJoinTimer();
       reconnectAt = 0;
-      app.screen = 'game';
+      app.screen = watch ? 'watch' : 'game';
       app.reconnecting = false;
       app.error = null;
       saveCode(code);
-      saveSession({ role: 'client', code, name: app.me.name });
+      // NO SESSION FOR A WATCHER, and this is the one line in the feature that
+      // would be a real bug if it were forgotten. resume() reads this record
+      // on boot and dials with role 'client' — so a TV that reloaded overnight
+      // would come back asking for a SEAT, take one, hold a hand nobody can
+      // see, and be waited on at every turn. For a watcher the URL is the
+      // session: `?watch=CODE` survives a reload by itself and says what it
+      // is, which is exactly what a record that lies about the role does not.
+      if (!watch) saveSession({ role: 'client', code, name: app.me.name });
       paint();
     },
 
@@ -659,6 +713,16 @@ function beginJoin(code, resuming = false) {
         const text = readRejectFrame(msg);
         if (text) app.error = text;
         app.busy = false;
+        // A WATCHER'S ONLY POSSIBLE REFUSAL IS "there is no room to watch",
+        // because a watcher sends nothing else to be refused about — no bid,
+        // no card, no config. So this is fatal where a player's refusal is a
+        // banner, and it has to be: the watcher cap only frees a slot if the
+        // turned-away device actually lets go of it. Left connected, it would
+        // sit there holding the connection it was told it could not have,
+        // still being sent every state frame, and the ceiling would mean
+        // nothing. teardown() for the same reason onReplaced uses it — the
+        // close that follows must not start the reconnect ladder.
+        if (watch) { teardown(); app.screen = 'error'; }
         paint();
       }
     },
@@ -704,18 +768,21 @@ function beginJoin(code, resuming = false) {
       // Says nothing to a client that is already in a game: its DataConnection
       // stopped needing the broker the moment the handshake finished, and a
       // warning about a server the player has never heard of is noise.
-      if (app.screen !== 'game') { app.netWarning = 'Reaching the matchmaking server…'; paint(); }
+      if (!inRoom()) { app.netWarning = 'Reaching the matchmaking server…'; paint(); }
     },
     onBrokerUp: () => { if (!live()) return; app.netWarning = null; paint(); },
     onBrokerLost: () => {
       if (!live()) return;
-      if (app.screen !== 'game') {
+      if (!inRoom()) {
         app.error = 'Could not reach the matchmaking server. Check your connection and try again.';
         app.screen = 'error';
         paint();
       }
     },
-  }, { name: app.me.name, clientId: MY_CLIENT_ID });
+    // WATCHER carries neither the name nor the ticket — see js/net.js. A
+    // watcher that sent its clientId would be handing over the one thing that
+    // identifies this device for a purpose it has no use for.
+  }, watch ? WATCHER : { name: app.me.name, clientId: MY_CLIENT_ID });
 
   clearJoinTimer();
   joinTimer = setTimeout(() => {
@@ -760,7 +827,11 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (epoch !== netEpoch) return;
-    beginJoin(app.code, true);
+    // app.watching, not a captured copy: the role cannot change between the
+    // drop and the redial — nothing in the app switches it while a ladder is
+    // running — and reading it here keeps "what am I" in one place rather than
+    // two that must agree.
+    beginJoin(app.code, { resuming: true, watch: app.watching });
   }, delay);
 }
 
@@ -819,6 +890,27 @@ function dispatch(msg) {
   paint();
 }
 
+/**
+ * Everything the two dial-a-room intents have in common: the library has to be
+ * there, and four characters have to be four characters.
+ *
+ * Shared rather than copied because the check and the sentence explaining it
+ * are the same check and the same sentence. A second copy would be right on
+ * the day it was written and would be the one that still said "four" after
+ * CODE_LENGTH moved — and the version of that sentence a watcher sees would
+ * be the one nobody ever reads during a normal game.
+ */
+function dialRoom(code, options) {
+  if (!requirePeer()) return;
+  const clean = normalizeCode(code);
+  if (clean.length !== CODE_LENGTH) {
+    app.error = `A room code is ${CODE_LENGTH} characters — letters and numbers, with no O, zero, I or one.`;
+    paint();
+    return;
+  }
+  beginJoin(clean, options);
+}
+
 const intents = {
   // --- navigation --------------------------------------------------------
   host() {
@@ -831,26 +923,34 @@ const intents = {
   goJoin() { app.screen = 'join'; app.error = null; paint(); },
 
   join(code) {
-    if (!requirePeer()) return;
-    const clean = normalizeCode(code);
-    if (clean.length !== 4) {
-      app.error = 'A room code is four characters — letters and numbers, with no O, zero, I or one.';
-      paint();
-      return;
-    }
+    // Before the dial, not after: a join that fails on a mistyped code should
+    // still have remembered the name that was typed next to it.
     saveName(app.me.name);
-    beginJoin(clean);
+    dialRoom(code, {});
   },
+
+  // No saveName. A watcher never gives one — see WATCHER in js/net.js — and
+  // writing whatever happens to be in the name field on the way past would
+  // mean a TV that was only ever used to watch has an opinion about who this
+  // device is.
+  watch(code) { dialRoom(code, { watch: true }); },
 
   cancelJoin() { teardown(); app.screen = 'join'; app.error = null; paint(); },
 
   goHome() {
     teardown();
     clearSession();
+    // AND DROP ?watch= FROM THE ADDRESS BAR. For a watcher that URL is the
+    // session — it is what brings a TV back to the right table after an
+    // overnight reload — so leaving it in place would mean Home is a screen
+    // you cannot reload your way off. Stripped here rather than at boot,
+    // because at boot it is still needed.
+    forgetWatchParam();
     app.screen = 'home';
     app.pub = null;
     app.priv = null;
     app.isHost = false;
+    app.watching = false;
     app.error = null;
     app.selected = null;
     app.selectedBid = null;
@@ -989,6 +1089,41 @@ function requirePeer() {
 // ###########################################################################
 
 /**
+ * The room code in `?watch=CODE`, or null.
+ *
+ * THE WHOLE SPECTATOR ENTRY POINT IS A QUERY PARAMETER ON index.html, not a
+ * second page, and that is not a preference. sw.js answers every navigation
+ * out of the cached shell, so a watch.html added to this repo would be served
+ * index.html by the service worker on any device that had ever loaded the app
+ * — working perfectly in development and silently showing the wrong page in
+ * production, which is the worst failure mode available.
+ *
+ * Read through URL rather than URLSearchParams on location.search directly so
+ * that a file:// open, where search is empty and nothing should happen, and a
+ * GitHub Pages subpath, where the origin is not the root, both behave. Wrapped
+ * because a malformed URL throws, and a thrown boot is a blank page.
+ */
+function watchParam() {
+  try {
+    const code = new URL(window.location.href).searchParams.get('watch');
+    return code === null ? null : normalizeCode(code);
+  } catch (_) { return null; }
+}
+
+/** Take ?watch= back out of the address bar without navigating. Best-effort:
+ *  replaceState is unavailable on file:// and throws on some embedded
+ *  browsers, and the cost of it failing is a stale query string, which is not
+ *  worth a blank page. */
+function forgetWatchParam() {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has('watch')) return;
+    url.searchParams.delete('watch');
+    window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+  } catch (_) { /* the address bar keeps a parameter nothing will read again */ }
+}
+
+/**
  * Pick up where this device left off, if it left off recently enough.
  *
  * loadSession() applies the eight-hour TTL, so anything it hands back is worth
@@ -1035,4 +1170,18 @@ window.addEventListener('beforeunload', (e) => {
   e.returnValue = '';
 });
 
-if (!resume()) paint();
+// THE URL BEATS THE STORED SESSION, and the order is the point.
+//
+// A device that has played here before still has a session record, and
+// loadSession()'s eight-hour TTL means it is usually still live. Ask resume()
+// first and a phone that was handed a ?watch= link would rejoin its own old
+// table instead — taking a seat, holding a hand, and being waited on — while
+// the link that was just followed does nothing at all. The URL is the more
+// recent and more explicit statement of intent, so it goes first.
+//
+// requirePeer() is inside dialRoom, and a four-character code is checked
+// there too, so a hand-edited `?watch=nonsense` lands on the home screen
+// with a sentence rather than on a spinner.
+const watchCode = watchParam();
+if (watchCode) intents.watch(watchCode);
+else if (!resume()) paint();

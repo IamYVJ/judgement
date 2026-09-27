@@ -96,6 +96,7 @@ import {
   CONN_ID_PREFIX, HOST_ID, playerIdForConn, connIdForPlayer,
   WIRE, joinFrame, readJoinFrame, stateFrameFor, readStateFrame,
   rejectFrame, readRejectFrame, replacedFrame, isReplacedFrame,
+  watchFrame, isWatchFrame, WATCHER, MAX_WATCHERS,
   peerAvailable, isFatalPeerError, describePeerError, createHost, joinHost,
 } from '../js/net.js';
 import { installPeerJS, installStorage, installClock, withoutPeerJS } from './peershim.mjs';
@@ -6756,6 +6757,22 @@ section('UI: the rules are one tap away, from every screen there is');
     });
   }
 
+  // THE TELEVISION, swept the same way and for the same reason. The SCREENS
+  // loop above already drew `watch`, but only with pub: null — which is one of
+  // watchScreen()'s THREE returns, and the other two are the ones people will
+  // actually sit in front of. Checking the list of screens rather than the
+  // list of things each screen can be is how "the lobby branch forgot the help
+  // button" ships green. priv is null throughout because a watcher holds no
+  // seat and stateFrameFor() has none to send.
+  sweepLobby((g, pub) => {
+    check(baseApp({ screen: 'watch', pub, priv: null }), `watch lobby seats=${pub.seats.length}`);
+  });
+  for (const config of UI_CONFIGS) {
+    sweepMatch(config, 4, (g, pub) => {
+      check(baseApp({ screen: 'watch', pub, priv: null }), `watch ${config.scoring}/${pub.phase}`);
+    });
+  }
+
   // THE PAIRED POSITIVE. A bug in the sweep that produced no frames at all
   // would leave every counter below at zero and the section would read as a
   // clean pass. Silence is not honesty.
@@ -7910,6 +7927,10 @@ function liveTable(clock, { code = 'QRTX', hostName = 'Ana', hostTicket = 'host-
     // and a test that only counts errors agrees with a ladder that fired all
     // of them in the same millisecond, or with one that has an extra rung.
     errorAt: [],
+    // [playerId, accepted] per WATCH hello. `accepted` false is the cap being
+    // hit, which is the one refusal a watcher can receive and therefore the
+    // only thing that makes the cap mean anything.
+    watches: [],
     brokerDown: 0, brokerUp: 0, brokerLost: 0, lostAt: null, pushes: 0,
     // Asserted from inside onConnect, where the claim is that the caller can
     // already use the id it was just handed.
@@ -7947,6 +7968,16 @@ function liveTable(clock, { code = 'QRTX', hostName = 'Ana', hostTicket = 'host-
       const r = engine.addPlayer(pid, hello.name, { clientId: hello.clientId });
       if (!r.ok) { host.sendTo(pid, rejectFrame(r.error)); return; }
       push();
+    },
+    // WIRED THE WAY main.js WIRES IT, which for a watcher means doing nothing
+    // on the happy path: the connection is already open and pushState()
+    // already broadcasts to it, so an accepted watcher needs no handling at
+    // all. The handler exists for the refusal.
+    onWatch: (pid, accepted) => {
+      seen.watches.push([pid, accepted]);
+      if (!accepted) {
+        host.sendTo(pid, rejectFrame('This table already has as many screens watching as it can carry.'));
+      }
     },
     onData: (pid, msg) => {
       seen.data.push([pid, msg.type]);
@@ -8894,6 +8925,343 @@ section('The transport: one connection, one identity, one ticket');
   ok(box.rejects.length > 0, `${box.rejects.length} of them came back as refusals, to that device only`);
   eq(table.seen.errors.length, 0, 'and nothing errored');
   eq(box.closes, 0, 'and nobody was cut off for sending nonsense politely');
+
+  table.teardown();
+  net.uninstall();
+}
+
+// ===========================================================================
+section('The spectator: a peer with no seat, and nothing it can touch');
+// ===========================================================================
+
+// WHY THERE IS A WATCH FRAME AT ALL, given that a spectator would already
+// work without one. A connection that never says hello is harmless: seatOf()
+// answers −1, every intent is refused at source, stateFrameFor() sends
+// priv: null, and pushState() broadcasts to it regardless. Nothing in that
+// list needed a new frame type.
+//
+// What needed it is the CAP. Without a declared intent the host cannot tell a
+// television from a player who has not finished typing a name, so it cannot
+// count watchers, so it cannot stop thirty of them from eating the connection
+// budget a table needs for reconnects. The frame exists to be counted. Every
+// property below is therefore about either the counting or the silence.
+
+// --- the frame, before any network is involved ----------------------------
+{
+  ok(isWatchFrame(watchFrame()), 'a watch frame is recognised as one');
+  same(Object.keys(WATCHER).sort(), ['watch'],
+    'and the identity a client passes to ask for one carries nothing else');
+
+  // NOT A HELLO, and not anything else either. Swept over every constructor
+  // in the wire rather than checked against join alone — the failure this
+  // guards is a reader that is loose enough to accept a neighbour, and the
+  // neighbour that matters is whichever one gets added next.
+  const EVERY_FRAME = [
+    ['join', joinFrame('Ana', 'ticket-01')],
+    ['state', stateFrameFor(connIdForPlayer(HOST_ID), { phase: PHASES.LOBBY, seats: [] }, () => null)],
+    ['reject', rejectFrame('no')],
+    ['replaced', replacedFrame()],
+    ...GAME_INTENTS.map((t) => [t, { type: t }]),
+  ];
+  let confused = 0;
+  for (const [name, frame] of EVERY_FRAME) {
+    if (isWatchFrame(frame)) { confused++; console.error(`  ✗ FAIL: a '${name}' frame reads as a watch hello`); }
+  }
+  eq(confused, 0, `and none of the ${EVERY_FRAME.length} other frames on the wire is mistaken for one`);
+  eq(readJoinFrame(watchFrame()), null, 'and a watch frame is not readable as a hello');
+
+  // JUNK, the same sweep the other readers get. isWatchFrame's guard is one
+  // `!!msg` and that is exactly the kind of line that gets simplified away.
+  let crashed = 0, accepted = 0;
+  for (const junk of [null, undefined, 0, '', 'watch', [], { type: null }, { type: 'watching' }]) {
+    try { if (isWatchFrame(junk)) accepted++; } catch { crashed++; }
+  }
+  eq(crashed, 0, 'no junk value makes the reader throw');
+  eq(accepted, 0, 'and none of it is accepted as a watch hello');
+}
+
+// --- the budget, stated as what it buys rather than as its own formula -----
+{
+  // Copying `MAX_HOST_CONNS - 4 * (MAX_PLAYERS - 1)` down here would assert
+  // that net.js says what net.js says. What is worth asserting is the
+  // CONSEQUENCE: watchers must be possible at all, and must not be able to
+  // crowd out a table that is full and churning.
+  ok(MAX_WATCHERS >= 1, `at least one screen can watch (${MAX_WATCHERS})`);
+  ok(MAX_WATCHERS + MAX_PLAYERS <= MAX_HOST_CONNS,
+    `a full table of ${MAX_PLAYERS} and all ${MAX_WATCHERS} watchers fit inside ${MAX_HOST_CONNS} connections`);
+  // The headroom is the point of the number, not a rounding of it. Every
+  // seated player may hold a stale connection or two mid-reconnect before the
+  // reaper collects them, and that churn has to fit alongside a full gallery.
+  const churn = MAX_HOST_CONNS - MAX_WATCHERS - MAX_PLAYERS;
+  ok(churn >= MAX_PLAYERS,
+    `with ${churn} spare — at least one extra connection per seat for reconnect churn`);
+}
+
+// EVERY READ OF THE WATCH LOG GOES THROUGH THESE. eq() reports and carries on,
+// so a `watches[0][1]` sitting under a failed length check still runs — and
+// then throws, and the whole file stops at a TypeError three hundred lines
+// before the assertions that would have said what actually went wrong. Found
+// exactly that way: the mutation that makes the client send a seat hello
+// instead of a watch hello leaves the log empty, and the run came back CRASH
+// instead of "the host was told a screen started watching — expected 1, got 0".
+// A missing record reads as "no id" and "not accepted", both of which are true.
+const watchedBy = (table, i) => (table.seen.watches[i] ? table.seen.watches[i][0] : null);
+const watchOk = (table, i) => (table.seen.watches[i] ? table.seen.watches[i][1] : 'no such watch hello');
+
+// --- a whole match, watched: never a card, never a seat, never a refusal ---
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  const ben = table.join('Ben', 'ticket-ben-01');
+  const cleo = table.join('Cleo', 'ticket-cleo-1');
+  clock.advance(20);
+  eq(table.engine.seats.length, 3, 'three players are seated');
+
+  // The television. Same joinHost() every player uses, one different identity.
+  const tv = table.join('TV', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+
+  // WHERE THE PLAYER'S TRANSCRIPT WAS WHEN THE TELEVISION ARRIVED. Ben was
+  // already at the table for two pushes — his own join and Cleo's — and no
+  // device receives a broadcast from before it connected. Comparing the two
+  // transcripts from index zero would report that offset as two missing
+  // frames, which is a fact about arrival order and not about watchers.
+  const benBase = ben.states.length;
+  ok(benBase > 0, `the player's transcript was ${benBase} frames deep before the screen connected`);
+
+  eq(table.seen.watches.length, 1, 'the host was told a screen started watching');
+  eq(watchOk(table, 0), true, 'and accepted it');
+  eq(table.engine.seats.length, 3, 'and it took no seat');
+  eq(table.seen.joins.length, 2, 'and was never announced as a joiner');
+  ok(table.host.playerIds().includes(watchedBy(table, 0)),
+    'it is a connection the host can address, which is how it is sent state at all');
+
+  table.engine.setConfig(HOST_ID, { shape: 'descending', maxHand: 3, trumpMethod: 'turnup' });
+  table.engine.startMatch(HOST_ID, clock.elapsed());
+  table.push();
+
+  // THE ASSERTION THE WHOLE FEATURE TURNS ON, swept over every state of a
+  // real match rather than sampled at one phase. `turnup` on purpose: it is
+  // the method with a card that exists and must not be public yet, so a frame
+  // that leaked the turn-up early would show up here and nowhere else.
+  //
+  // READ OFF THE WIRE AT PUSH TIME, not out of the client's inbox. The two
+  // are a beat apart — pushState queues, the fake network delivers on the
+  // next clock advance — and the entitlement set is NOT stable across that
+  // beat: publiclyVisible() narrows when a round ends and its completed
+  // tricks are cleared. Auditing yesterday's frame against today's set
+  // reports seventeen leaks that are entirely clock skew, which is what the
+  // first version of this block did. Frame and set are sampled together.
+  // `|| { sent: [] }` for the same reason as watchedBy() above: a mutation
+  // that stops the watch hello from being sent leaves no connection to find,
+  // and a null deref here would end the run with a TypeError in place of the
+  // assertions that say what broke. An empty transcript is the honest stand-in
+  // — every count below then comes back zero and the derived floor fails loudly.
+  const tvConnFound = table.host.connections.get(connIdForPlayer(watchedBy(table, 0) || 'nobody'));
+  ok(!!tvConnFound, 'the television holds a connection the host can read back');
+  const tvConn = tvConnFound || { sent: [] };
+  let cursor = tvConn.sent.length;
+  let audited = 0, withPriv = 0, leaked = 0, unreadable = 0;
+  const audit = () => {
+    const allowed = tableVisible(table.engine);
+    for (let i = cursor; i < tvConn.sent.length; i++) {
+      audited++;
+      // Through the same front door the real client uses — a frame the host
+      // can build but its own reader refuses is a bug either way.
+      const read = readStateFrame(decodePeerFrame(tvConn.sent[i]));
+      if (!read) { unreadable++; continue; }
+      if (read.priv !== null) withPriv++;
+      // Every card in the frame against what the WHOLE TABLE may see, reusing
+      // the engine's own definition rather than restating it: if that
+      // definition widens again this widens with it instead of going stale. A
+      // watcher's entitlement is exactly the public set and never more,
+      // because there is no seat to add anything to it.
+      for (const code of codesIn(read)) if (!allowed.has(code)) leaked++;
+    }
+    cursor = tvConn.sent.length;
+  };
+
+  pickSeed(414);
+  const made = playOverTheWire(clock, table, audit);
+
+  eq(table.engine.phase, PHASES.MATCH_OVER, `the watched match played out in ${made.steps} steps`);
+  // DERIVED FLOOR, not a magic one. Every bid and every card is a move, and
+  // every move is a push, so the match cannot have produced fewer frames than
+  // it had moves. A hand-picked number goes green on a match that quietly
+  // played one round.
+  ok(audited >= made.bids + made.cards,
+    `${audited} frames were pushed to the television across ${made.bids + made.cards} moves`);
+  eq(unreadable, 0, 'every one of them is a state frame its own client accepts');
+  eq(withPriv, 0, 'not one of them carried a private half');
+  eq(leaked, 0, 'and none contained a card the whole table was not already looking at');
+  eq(tv.seat(), -1, 'and at the end of it the watcher still holds no seat');
+
+  // THE OTHER HALF: not less, either. A watcher gets the SAME public state a
+  // seat gets, byte for byte and frame for frame — which is what makes the
+  // board on the television the same game everyone else is playing. Compared
+  // against a real player's frames rather than asserted about in isolation,
+  // because "the watcher saw nothing" passes every check above on its own.
+  eq(tv.states.length, ben.states.length - benBase,
+    `the television got one frame for every frame a player got, all ${tv.states.length} of them`);
+  let diverged = 0, privSeen = 0;
+  for (let i = 0; i < tv.states.length; i++) {
+    if (JSON.stringify(tv.states[i].pub) !== JSON.stringify(ben.states[benBase + i].pub)) diverged++;
+    if (tv.states[i].priv !== null) privSeen++;
+  }
+  eq(diverged, 0, 'and every one of them held exactly the public state that player held');
+  eq(privSeen, 0, 'with the private half null in all of them');
+  ok(codesIn(ben.states[ben.states.length - 1]).length > 0,
+    'while the player it was compared against really was being dealt cards');
+  eq(tv.rejects.length, 0, 'a watcher that says nothing is never refused');
+  eq(tv.net.badFrames(), 0, 'and never sees a malformed frame');
+
+  table.teardown();
+  net.uninstall();
+}
+
+// --- everything it can say, and what changes when it says it ---------------
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  table.join('Ben', 'ticket-ben-01');
+  table.join('Cleo', 'ticket-cleo-1');
+  clock.advance(20);
+  table.engine.startMatch(HOST_ID, clock.elapsed());
+  table.push();
+
+  const tv = table.join('TV', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+
+  // SWEPT OVER THE REAL EXPORT, not over the three intents I would have
+  // thought of. An intent added next month is covered the day it is added,
+  // which is the only version of this check that stays true.
+  const before = JSON.stringify(table.engine.serialize());
+  for (const type of GAME_INTENTS) tv.net.send({ type, code: 'AS', bid: 0, patch: { maxHand: 9 } });
+  clock.advance(50);
+  const after = JSON.stringify(table.engine.serialize());
+
+  eq(after, before, `none of the ${GAME_INTENTS.length} game intents moved the game`);
+  eq(tv.rejects.length, GAME_INTENTS.length, 'every one of them came back refused');
+  eq(table.engine.seats.length, 3, 'and the table still holds exactly the players it did');
+
+  // THE REFUSAL IS NOT THE TRANSPORT'S OPINION. net.js deliberately holds no
+  // second view of who may do what — it hands every intent to the engine, and
+  // the engine refuses because there is no seat. Asserted by checking the
+  // frames ARRIVED: a transport that had quietly started filtering them would
+  // pass the "nothing changed" check above while introducing a second place
+  // where legality lives.
+  const arrived = GAME_INTENTS.filter((t) => table.seen.data.some(([, seen]) => seen === t));
+  same(arrived.slice().sort(), GAME_INTENTS.slice().sort(),
+    'and each of them reached the engine to be refused there, not silently dropped in the wire');
+
+  table.teardown();
+  net.uninstall();
+}
+
+// --- one connection is a player or a gallery, never both ------------------
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  table.join('Ben', 'ticket-ben-01');
+  table.join('Cleo', 'ticket-cleo-1');
+  clock.advance(20);
+
+  // A watcher that then tries to take a seat. Unreachable through joinHost(),
+  // which sends one hello and never a second — so it goes down the raw wire,
+  // the same way every other door check is reached.
+  const tv = table.join('TV', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+  const seatsBefore = table.engine.seats.length;
+  const refusedBefore = table.host.refusedFrames();
+  tv.wire().send(JSON.stringify(joinFrame('Sneaky', 'ticket-sneak-1')));
+  clock.advance(20);
+  eq(table.engine.seats.length, seatsBefore, 'a watcher that sends a hello does not get a seat');
+  ok(table.host.refusedFrames() > refusedBefore, 'the hello was refused rather than ignored');
+
+  // And the other way round. A seated player asking to watch must not be
+  // counted as a watcher, because a count that drifts upward is a cap that
+  // closes the gallery to people who are not in it.
+  const ben = table.clients[0];
+  // Captured, not written down: seat 0 is the host's, so a literal here would
+  // be asserting where in the roster the harness happens to put people.
+  const benSeat = ben.seat();
+  ok(benSeat >= 0, `the player about to try this really is seated (seat ${benSeat})`);
+  const watchesBefore = table.seen.watches.length;
+  ben.wire().send(JSON.stringify(watchFrame()));
+  clock.advance(20);
+  eq(table.seen.watches.length, watchesBefore, 'a seated player asking to watch is not counted as one');
+  eq(ben.seat(), benSeat, 'and keeps the seat it had');
+
+  // TWICE ON ONE CONNECTION. The `if (watching) return;` is a line that looks
+  // redundant and is not: without it a television with a flaky link that
+  // re-sent its hello would consume two of a very small number of slots.
+  const twice = table.join('TV2', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+  const afterFirst = table.seen.watches.length;
+  twice.wire().send(JSON.stringify(watchFrame()));
+  twice.wire().send(JSON.stringify(watchFrame()));
+  clock.advance(20);
+  eq(table.seen.watches.length, afterFirst, 'and a repeated watch hello is counted once, not three times');
+
+  table.teardown();
+  net.uninstall();
+}
+
+// --- the cap, and the slot coming back ------------------------------------
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  table.join('Ben', 'ticket-ben-01');
+  clock.advance(20);
+
+  // EXACTLY THE CAP, derived. A hard-coded eight here would go green against
+  // a build that had quietly halved it.
+  const tvs = [];
+  for (let i = 0; i < MAX_WATCHERS; i++) {
+    tvs.push(table.join(`TV${i}`, 'ignored', { identity: WATCHER }));
+    clock.advance(10);
+  }
+  eq(table.seen.watches.length, MAX_WATCHERS, `${MAX_WATCHERS} screens are watching`);
+  eq(table.seen.watches.filter(([, ok_]) => ok_).length, MAX_WATCHERS, 'and every one of them was accepted');
+  eq(table.engine.seats.length, 2, 'and none of them took a seat');
+
+  const tooMany = table.join('TV-late', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+  eq(table.seen.watches.length, MAX_WATCHERS + 1, 'the next one is still told about');
+  eq(watchOk(table, MAX_WATCHERS), false, 'and is not accepted');
+  eq(tooMany.rejects.length, 1, 'and is told why rather than left on a spinner');
+
+  // A FULL TABLE STILL FORMS WITH THE GALLERY FULL. This is the property the
+  // cap exists for, and it is worth operating rather than deriving: every
+  // remaining seat is filled while MAX_WATCHERS screens hold connections.
+  let seatedAll = true;
+  for (let i = table.engine.seats.length; i < MAX_PLAYERS; i++) {
+    const p = table.join(`P${i}`, `ticket-late-${i}`);
+    clock.advance(10);
+    if (p.seat() < 0) seatedAll = false;
+  }
+  ok(seatedAll, `all ${MAX_PLAYERS} seats filled with ${MAX_WATCHERS} screens already watching`);
+  eq(table.engine.seats.length, MAX_PLAYERS, 'and the table is full');
+
+  // THE SLOT COMES BACK. drop() decrementing the count is one line and it is
+  // the line that turns a cap into a permanent ceiling if it is missing: the
+  // gallery would fill once over the life of the room and never empty.
+  tvs[0].net.destroy();
+  clock.advance(200);
+  const watchesBefore = table.seen.watches.length;
+  const replacement = table.join('TV-again', 'ignored', { identity: WATCHER });
+  clock.advance(20);
+  eq(table.seen.watches.length, watchesBefore + 1, 'a screen that left freed its slot');
+  eq(watchOk(table, watchesBefore), true, 'and the next screen in was accepted');
+  eq(replacement.rejects.length, 0, 'with nothing to tell it');
 
   table.teardown();
   net.uninstall();
@@ -11098,7 +11466,21 @@ section('The seams: two files, one string, and nothing enforcing it');
   ];
   const everyWay = (over) => { for (const f of FLAGS) grab(baseApp({ ...over, ...f })); };
 
-  for (const screen of ['home', 'join', 'connecting', 'error', 'hostleft', 'game']) {
+  // THE SPECTATOR FRAME THAT PAIRS WITH A PLAYER FRAME. Every place the sweep
+  // renders a pub as `screen: 'game'` it now renders the same pub as
+  // `screen: 'watch'` too, and the priv is null rather than omitted for
+  // brevity: a watcher holds no seat, stateFrameFor() answers a seatless
+  // connection with priv: null, and so null is the ONLY private state a watch
+  // frame can ever be in. Pairing them here is what keeps the television
+  // covered by the same sweep that covers the phone — a separate loop over a
+  // hand-listed set of watch states would go stale the first time a phase was
+  // added, which is the exact failure this seam exists to catch.
+  const bothWays = (pub, priv) => {
+    everyWay({ screen: 'game', pub, priv });
+    everyWay({ screen: 'watch', pub, priv: null });
+  };
+
+  for (const screen of ['home', 'join', 'connecting', 'error', 'hostleft', 'game', 'watch']) {
     everyWay({ screen, pub: null, priv: null });
   }
 
@@ -11111,7 +11493,7 @@ section('The seams: two files, one string, and nothing enforcing it');
     for (const cfg of [{}, ...UI_CONFIGS]) {
       g.setConfig('p0', cfg);
       const pub = g.publicState();
-      for (const id of ['p0', 'p1', 'nobody']) everyWay({ screen: 'game', pub, priv: g.privateStateFor(id) });
+      for (const id of ['p0', 'p1', 'nobody']) bothWays(pub, g.privateStateFor(id));
     }
   }
 
@@ -11135,7 +11517,7 @@ section('The seams: two files, one string, and nothing enforcing it');
         onState: (g) => {
           const pub = g.publicState();
           for (const l of pub.log) kinds.add(l.kind);
-          for (const id of ['p0', 'p1', 'nobody']) everyWay({ screen: 'game', pub, priv: g.privateStateFor(id) });
+          for (const id of ['p0', 'p1', 'nobody']) bothWays(pub, g.privateStateFor(id));
         },
       });
     }
@@ -11161,7 +11543,7 @@ section('The seams: two files, one string, and nothing enforcing it');
     const pub = back.publicState();
     ok(pub.seats.some((s) => !s.connected && !s.isBot),
       'and a seat that was away is still away — otherwise this frame proves nothing');
-    for (const id of ['p0', 'p1', 'nobody']) everyWay({ screen: 'game', pub, priv: back.privateStateFor(id) });
+    for (const id of ['p0', 'p1', 'nobody']) bothWays(pub, back.privateStateFor(id));
   }
 
   // Classes that never pass through the renderer: authored into index.html, or

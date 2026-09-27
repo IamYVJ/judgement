@@ -1020,6 +1020,206 @@ tbody tr.now td { background: var(--accent-dim); }
 body.in-play .site-footer { display: none; }
 
 /* ==========================================================================
+   THE TV — the spectator board
+   ==========================================================================
+
+   EVERY SIZE IN HERE IS A CONTAINER UNIT, and that is the whole design.
+
+   This screen is looked at from across a room on a panel that might be 1366
+   wide standing in for a television or 1920 across a living room, and the
+   thing that must not change between the two is the RATIO of the cards to the
+   names to the scores. cqh and cqw make the board one drawing that scales;
+   px would make it a set of breakpoints that drift apart, and the drift would
+   show up as a clipped name at exactly one width nobody tested.
+
+   The numbers came out of _tvsketch.html, which rendered every phase at 1366
+   and 1920 and MEASURED overflow, clipping and the smallest rendered type —
+   0 overflow everywhere, nothing clipped, smallest type 21px at 1920 and 15px
+   at 1366. Looking at a screenshot would not have told me any of that.
+
+   Note what is NOT here: no hover, no focus styling, no transitions on
+   anything a viewer could trigger. Nothing on this screen is reachable, so
+   nothing on it should suggest it is. */
+
+.tv {
+  /* `size`, not `inline-size`. cqh is meaningless without block containment,
+     and half of this layout is sized off the height — the cards especially,
+     so that a seven-card trick and a three-card trick read the same from the
+     same distance. */
+  container-type: size;
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tv * { cursor: default; user-select: none; }
+
+/* --- the standing facts, across the top ---------------------------------- */
+.tv-bar {
+  flex: none;
+  display: flex; align-items: center; gap: 3cqw;
+  padding: 1.6cqh 2.2cqw;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 3.1cqh;
+  color: var(--muted);
+}
+.tv-bar b { color: var(--text); font-weight: 700; }
+.tv-trump { display: inline-flex; align-items: baseline; gap: 0.5cqw; }
+.tv-trump .g { font-size: 4.2cqh; line-height: 1; color: var(--text); }
+.tv-trump .g.red { color: var(--card-red); }
+/* The code sits on screen permanently and on purpose. A television is how
+   somebody who wandered into the room finds out how to watch, and how a player
+   whose phone died gets back in. It is the only useful thing a screen with no
+   input can offer, so it is never hidden and never small. */
+.tv-code {
+  margin-left: auto;
+  font-family: var(--mono); font-weight: 700;
+  font-size: 3.6cqh; letter-spacing: 0.18em;
+  color: var(--accent);
+}
+
+/* --- the middle, which is whatever the phase is about --------------------- */
+.tv-main { flex: 1 1 auto; min-height: 0; display: flex; }
+.tv-table {
+  flex: 1 1 auto; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2.4cqh;
+  padding: 2cqh 2cqw;
+}
+.tv-lede { margin: 0; font-size: 3.4cqh; color: var(--muted); text-align: center; }
+.tv-lede b { color: var(--text); font-weight: 700; }
+
+.tv-trick {
+  display: flex; gap: 1.6cqw;
+  align-items: flex-end; justify-content: center; flex-wrap: wrap;
+}
+.tv-play { display: flex; flex-direction: column; align-items: center; gap: 0.9cqh; }
+.tv-play .who {
+  font-size: 2.4cqh; color: var(--muted); max-width: 12cqw;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tv-play.lead .who { color: var(--text); font-weight: 700; }
+.tv-play.win .who { color: var(--accent); font-weight: 700; }
+
+/* THE SAME cardFace() THE PHONE DRAWS, re-sized rather than re-implemented.
+
+   WIDTH AND HEIGHT DIRECTLY, not by redefining --card-w and --card-h here.
+   That token is not private to .card: the fanned bidding hand caps each
+   overlapping SLOT at var(--card-w), and the slot is the card's parent, so
+   the whole reason the value is a custom property is that more than one
+   element has to agree on it. A token that means "the card's width" in one
+   subtree and something else in another has stopped being a token and become
+   a local variable with a global name — and the next reader of .hand.fan
+   would have no way to know which value it is getting. */
+.tv .card {
+  width: 13.2cqh;
+  height: 18.6cqh;
+  border-radius: 1.6cqh;
+  box-shadow: 0 0.8cqh 2cqh rgba(0, 0, 0, 0.45);
+}
+.tv .card-rank { font-size: 7.4cqh; }
+.tv .card-suit { font-size: 5.4cqh; }
+/* A placeholder for a trick with nothing in it yet, so the row keeps its
+   height and the board does not jump upward between one trick and the next. */
+.card-back {
+  background: repeating-linear-gradient(45deg,
+    var(--surface) 0 6px, var(--surface-2) 6px 12px);
+}
+
+/* --- the seats, along the bottom ----------------------------------------- */
+.tv-seats { flex: none; display: flex; gap: 1.2cqw; padding: 1.6cqh 2cqw 2.2cqh; }
+.tv-seat {
+  flex: 1 1 0; min-width: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 0.6cqh;
+  padding: 1.4cqh 0.8cqw; border-radius: 1.4cqh;
+  background: var(--surface);
+  border: 2px solid transparent;
+}
+/* WHOSE TURN IT IS, three ways over. A border and a fill and the lede above
+   all say the same thing, because this has to be findable in under a second
+   from four metres on a panel that may be badly calibrated, seen at an angle,
+   by somebody who cannot separate the accent from the background. */
+.tv-seat.turn { border-color: var(--accent); background: var(--accent-dim); }
+.tv-seat.gone { opacity: 0.4; }
+.tv-seat .nm {
+  font-size: 2.6cqh; font-weight: 700; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Tricks over bid, as a pair, because neither half means anything alone:
+   three tricks is a triumph against a bid of three and a disaster against a
+   bid of nought. */
+.tv-seat .pair { font-size: 4.6cqh; font-weight: 700; line-height: 1; }
+.tv-seat .pair .got { color: var(--text); }
+.tv-seat .pair .sep { color: var(--muted); margin: 0 0.3cqw; }
+/* ACCENT MEANS MADE, everywhere in this app — .result.made and .cell-pts.made
+   are the same magenta and the same meaning. The sketch used a green here and
+   green appears nowhere else in the palette; borrowing one for the TV would
+   have meant the same fact wearing two colours depending which screen you
+   read it on. */
+.tv-seat .pair.met .got { color: var(--accent); }
+.tv-seat .tot { font-size: 2.8cqh; font-family: var(--mono); color: var(--muted); }
+.tv-seat .badge {
+  font-size: 1.9cqh; letter-spacing: 0.1em; color: var(--muted);
+  text-transform: uppercase; min-height: 1.9cqh;
+}
+
+/* --- between rounds, and at the end -------------------------------------- */
+.tv-result { display: flex; flex-direction: column; align-items: center; gap: 1.6cqh; }
+.tv-result .big { font-size: 6cqh; font-weight: 700; }
+.tv-rows { display: flex; flex-direction: column; gap: 0.7cqh; font-size: 2.8cqh; }
+.tv-rows .row { display: flex; gap: 1.4cqw; align-items: baseline; }
+.tv-rows .row .d { min-width: 10cqw; text-align: right; color: var(--muted); }
+.tv-rows .row .up { color: var(--accent); }
+.tv-rows .row .dn { color: var(--warn); }
+
+/* --- before the match, and before the first frame ------------------------ */
+.tv-lobby, .tv-wait {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2.4cqh;
+  padding: 2cqh 2cqw;
+}
+.tv-wait p { margin: 0; font-size: 3cqh; color: var(--muted); }
+/* The lobby is the screen a television sits on longest — it gets switched on
+   before the game starts — so the code is the whole point of it and is sized
+   to be read from the back of the room rather than merely to be present. */
+.tv-bigcode {
+  font-family: var(--mono); font-weight: 700;
+  font-size: 18cqh; line-height: 1; letter-spacing: 0.14em;
+  color: var(--accent);
+}
+.tv-lobby .tv-seats { align-self: stretch; }
+
+/* The two controls, and they contradict everything above about nothing being
+   reachable. They are here because the other way in is a phone: whoever
+   pressed WATCH is holding the device this is drawn on, and without the exit
+   the only way out is closing the tab. Dimmed into a corner, where a viewer
+   across the room will never see them and a thumb can still find them.
+
+   PINNED AS A GROUP, not individually, so the help button cannot sit beside
+   the exit at one aspect ratio and underneath it at another. */
+.tv-chrome {
+  position: absolute; top: 0; right: 0;
+  display: flex; align-items: center;
+}
+.tv-exit, .tv-help {
+  width: 6cqh; height: 6cqh;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none;
+  color: var(--muted); opacity: 0.25; font-size: 2.6cqh;
+}
+/* .help-btn is a bordered 30px circle — a fixed pixel size on a board whose
+   every other dimension is a fraction of the container, so it reads as a
+   smudge on a 1920 panel and a blot on a 1366 one. The TV passes its own
+   class for that reason; this is the same bare glyph as the exit beside it. */
+.tv-help { padding: 0; border-radius: 50%; }
+.tv-exit:hover, .tv-exit:focus-visible,
+.tv-help:hover, .tv-help:focus-visible { opacity: 1; }
+
+/* ==========================================================================
    MOTION
    ========================================================================== */
 

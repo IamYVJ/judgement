@@ -100,6 +100,7 @@ export function render(root, app, intents) {
     case 'hostleft':   node = hostLeftScreen(app, intents); break;
     case 'replaced':   node = replacedScreen(app, intents); break;
     case 'game':       node = gameScreen(app, intents); break;
+    case 'watch':      node = watchScreen(app, intents); break;
     default:           node = homeScreen(app, intents);
   }
   root.appendChild(node);
@@ -255,6 +256,21 @@ function joinScreen(app, intents) {
         }, 'JOIN'),
         el('button', { class: 'btn btn-secondary', onclick: intents.goHome }, 'BACK'),
       ),
+      // WATCH IS NOT IN THE ROW ABOVE, deliberately. It is a different kind of
+      // thing from JOIN and BACK — it goes somewhere neither of them goes, and
+      // it is the answer to a question most people arriving here are not
+      // asking. Put beside JOIN it would be a coin toss at the moment of
+      // joining, which is the one moment it must not be; put below, it is
+      // findable by the person casting a game to a television and ignorable by
+      // everybody else. Same code field, same validation, same four characters.
+      // btn-ghost btn-wide, not a new class: muted colour is already what
+      // "this is here if you want it" looks like in this app, and btn-wide
+      // stops `flex: 0 1 auto` shrink-wrapping it to its own text width on a
+      // line of its own, which reads as an accident.
+      el('button', {
+        class: 'btn btn-ghost btn-wide', disabled: (app.code || '').length !== 4,
+        onclick: () => intents.watch(app.code),
+      }, 'WATCH ON A BIG SCREEN'),
     ),
     errorNote(app),
     liveRegion(app.announce),
@@ -328,6 +344,245 @@ function replacedScreen(app, intents) {
     ),
     liveRegion(app.announce),
   );
+}
+
+// ###########################################################################
+//
+//  THE TV — a read-only board for a screen nobody can reach
+//
+// ###########################################################################
+//
+// A SPECTATOR IS A PEER WITH NO SEAT, and almost everything that makes that
+// safe was already true before this screen existed: the engine answers
+// seatOf() with −1 for an unseated connection, so every intent is refused at
+// source, and stateFrameFor() sends `priv: null` because there is no private
+// state to send. This file therefore reads app.pub and NEVER app.priv, which
+// is not a convention — it is the only thing there is. A watcher's app.priv is
+// null in every phase of every match, and the suite asserts it over the full
+// sweep rather than trusting the sentence you are reading.
+//
+// THE OTHER HALF OF "read-only" IS THAT NOTHING HERE IS PRESSABLE. There are
+// no handlers on anything except the exit, because a television has no pointer
+// and a phone mirroring to one must not be able to disturb the game by being
+// sat on. Where the play screen has buttons, this has spans.
+//
+// SIZED IN CONTAINER UNITS, not viewport units and not pixels, for a reason
+// the sketch measured: the same markup has to be legible on a 1366-wide laptop
+// standing in for a TV and on a 1920 panel across a room, and the thing that
+// must not change between them is the RATIO of the cards to the names to the
+// scores. cqh/cqw against a container makes the whole board one drawing that
+// scales; px would make it four breakpoints that drift apart. The numbers came
+// out of _tvsketch.html, where every case was measured for overflow, clipping
+// and smallest rendered type at both widths rather than looked at.
+//
+// ###########################################################################
+
+/**
+ * The TV. Its own root, and NOT shell().
+ *
+ * shell() is `max-width: var(--maxw)` — 640px, a phone column, correct for
+ * every other screen in the app and exactly wrong here. A board squeezed into
+ * 640px in the middle of a television is the one outcome this feature has to
+ * avoid, so the TV starts from its own element and fills what it is given.
+ */
+function watchScreen(app, intents) {
+  const { pub } = app;
+
+  // FIRST PAINT, BEFORE ANY STATE HAS ARRIVED. Real and not rare: beginJoin
+  // sets screen 'watch' in onOpen, and the first state frame is a round trip
+  // behind it. Without this the next line would read pub.phase off null and
+  // render() — which opens with clear(root) — would leave a blank page with
+  // nothing on it and no way back.
+  if (!pub) {
+    return el('main', { class: 'tv' },
+      el('div', { class: 'tv-wait' },
+        el('span', { class: 'spinner' }),
+        el('p', {}, `Joining room ${app.code || ''}…`)),
+      tvChrome(intents),
+      liveRegion(app.announce));
+  }
+
+  // THE LOBBY IS THE NORMAL CASE, not an edge one. A television gets switched
+  // on before the game starts, so this is the screen it will sit on longest —
+  // and the thing it has to do during that time is tell people in the room the
+  // code, in characters readable from the sofa.
+  if (pub.phase === PHASES.LOBBY) {
+    return el('main', { class: 'tv' },
+      el('div', { class: 'tv-lobby' },
+        el('p', { class: 'tv-lede' }, 'Join this game with the code'),
+        el('span', { class: 'tv-bigcode' }, app.code || ''),
+        el('div', { class: 'tv-seats' }, pub.seats.map((s) => el('div', { class: 'tv-seat' },
+          el('span', { class: 'nm' }, s.name),
+          el('span', { class: 'badge' }, s.isBot ? 'bot' : (s.isOwner ? 'host' : ''))))),
+        el('p', { class: 'tv-lede' }, pub.seats.length === 0
+          ? 'Nobody has joined yet.'
+          : `${plural(pub.seats.length, 'player')} in. Waiting for the host to start.`)),
+      tvChrome(intents),
+      liveRegion(app.announce));
+  }
+
+  return el('main', { class: 'tv' },
+    tvBar(app),
+    el('div', { class: 'tv-main' }, el('div', { class: 'tv-table' }, tvMiddle(pub))),
+    el('div', { class: 'tv-seats' }, pub.seats.map((s) => tvSeat(pub, s))),
+    tvChrome(intents),
+    liveRegion(app.announce));
+}
+
+/**
+ * The only two controls on the whole screen, as ONE node.
+ *
+ * They contradict "nothing here should look reachable", and they are here
+ * anyway, because the other entry point is a phone: somebody who pressed WATCH
+ * ON A BIG SCREEN on the join screen is holding the device this is rendering
+ * on. Discreet rather than absent — dimmed into a corner, where a television
+ * viewer never notices them and a thumb can still find them.
+ *
+ * ONE HELPER RATHER THAN TWO CALLS IN EACH BRANCH, because watchScreen()
+ * returns from three places and "the lobby branch forgot the help button" is
+ * precisely the bug the rules-route property exists to catch. Bundling them
+ * makes the three branches unable to disagree.
+ *
+ * WHY THE TV CARRIES THE RULES AT ALL, when a television has no pointer: the
+ * spectator is the likeliest person in the room NOT to know the rules, and —
+ * unlike every other screen — they have no second device in the game to look
+ * them up on, because they never joined. Exempting this one screen would turn
+ * "the rules are always one tap away" into "usually", which roundOverScreen()
+ * already refused to do for the same reason. The sheet itself is the native
+ * <dialog> beside #app, so it is unaffected by the container-query layout
+ * here and opens as the same centred column of prose it is everywhere else.
+ */
+function tvChrome(intents) {
+  return el('div', { class: 'tv-chrome' },
+    helpBtn(intents, 'tv-help'),
+    el('button', { class: 'tv-exit', onclick: intents.goHome, 'aria-label': 'Stop watching' }, '✕'));
+}
+
+/** Round, hand size, trump, and the code — the four facts that are true for
+ *  the whole round and that somebody walking in mid-game needs. */
+function tvBar(app) {
+  const pub = app.pub;
+  const t = pub.trump;
+  return el('div', { class: 'tv-bar' },
+    el('span', {}, el('b', {}, `Round ${pub.roundIndex + 1}`), ` of ${pub.roundCount}`),
+    el('span', {}, plural(pub.roundSize, 'card')),
+    el('span', { class: 'tv-trump' }, 'Trump',
+      // The same three-way the rest of the app makes: a suit, no trump, or not
+      // decided yet. Under the turn-up method `trump` is null until the reveal
+      // and it must NOT be guessed at here — the brief is explicit that the
+      // flipped card does not exist publicly before that moment, and a TV
+      // showing it early would leak it to the whole room at once.
+      el('span', { class: `g${isRedSuit(t) ? ' red' : ''}` },
+        t === NO_TRUMP ? 'NT' : (isTrumpSuit(t) ? trumpGlyph(t) : '·'))),
+    el('span', { class: 'tv-code' }, app.code || ''));
+}
+
+/**
+ * One seat. Name, bid against tricks, running total, and a badge.
+ *
+ * WHOSE TURN IT IS gets three redundant cues — a border, a fill, and the
+ * position of the lede above — because this has to be findable in under a
+ * second from four metres away, on a panel that may be badly calibrated, at
+ * an angle, by somebody who cannot separate magenta from grey.
+ */
+function tvSeat(pub, s) {
+  const bidding = pub.phase === PHASES.BIDDING;
+  // MET, not "made". The round is not over, so this says "has as many tricks
+  // as they asked for right now", which is worth colouring because it is the
+  // number the room is watching and it can still be lost.
+  const met = s.bid !== null && s.tricks === s.bid;
+  return el('div', {
+    class: `tv-seat${s.seat === pub.turnSeat ? ' turn' : ''}${!s.connected && !s.isBot ? ' gone' : ''}`,
+  },
+    el('span', { class: 'nm' }, s.name),
+    bidding
+      // Mid-bidding there are no tricks yet, so a "0 / 3" would be reporting a
+      // failure that has not had a chance to happen. An ellipsis says "not
+      // said yet" and a bare number says what was said — and both are public
+      // the moment they exist, which is the rule the brief sets.
+      ? el('span', { class: 'pair' }, s.bid === null ? '…' : String(s.bid))
+      : el('span', { class: `pair${met ? ' met' : ''}` },
+        el('span', { class: 'got' }, String(s.tricks)),
+        el('span', { class: 'sep' }, '/'),
+        el('span', {}, s.bid === null ? '–' : String(s.bid))),
+    el('span', { class: 'tot' }, fmtScore(s.total)),
+    el('span', { class: 'badge' },
+      s.isBot ? 'bot' : (!s.connected ? 'away' : (s.seat === pub.dealerSeat ? 'dealer' : ''))));
+}
+
+/** Whatever the middle of the screen is about, which is entirely a question of
+ *  phase. Returns an array, because each branch is a different number of
+ *  children and wrapping them in a div would add a layout box for nothing. */
+function tvMiddle(pub) {
+  const nameOf = (seat) => (pub.seats[seat] ? pub.seats[seat].name : '');
+
+  if (pub.phase === PHASES.BIDDING) {
+    const inCount = pub.seats.filter((s) => s.bid !== null).length;
+    const sum = pub.seats.reduce((a, s) => a + (s.bid || 0), 0);
+    return [
+      el('p', { class: 'tv-lede' }, el('b', {}, nameOf(pub.turnSeat)), ' is bidding'),
+      el('div', { class: 'tv-result' },
+        // THE NUMBER THE TABLE ARGUES ABOUT: bids so far against tricks
+        // available. Over means somebody must fall short, under means somebody
+        // must take more than they asked for, and under the hook rule the last
+        // bidder is forbidden from making it equal. A watcher can see the whole
+        // shape of the round from this one line, which a player holding cards
+        // has to work out.
+        el('span', { class: 'big' }, `${sum} / ${pub.roundSize}`),
+        el('span', { class: 'tv-lede' }, `bid so far · ${inCount} of ${pub.seats.length} in`)),
+    ];
+  }
+
+  if (pub.phase === PHASES.ROUND_OVER || pub.phase === PHASES.MATCH_OVER) {
+    const last = pub.history[pub.history.length - 1];
+    return [
+      el('div', { class: 'tv-result' },
+        el('span', { class: 'big' }, pub.phase === PHASES.MATCH_OVER
+          ? `${pub.leaders.map(nameOf).join(' & ')} ${pub.leaders.length > 1 ? 'win' : 'wins'}`
+          : `Round ${pub.roundIndex + 1} done`),
+        // `last` can be missing — MATCH_OVER restored from a snapshot of a
+        // build that recorded less, and the lobby-phase fallback in state.js
+        // means an unrecognised phase arrives here with an empty history. The
+        // row still renders the totals, which are on the seat and always real.
+        el('div', { class: 'tv-rows' }, pub.seats.map((s) => {
+          const d = last && last.deltas ? last.deltas[s.seat] : null;
+          return el('div', { class: 'row' },
+            el('span', { class: 'd' }, s.name),
+            el('span', { class: d > 0 ? 'up' : (d < 0 ? 'dn' : '') },
+              d === null || d === undefined ? '' : fmtDelta(d)),
+            el('span', {}, `→ ${fmtScore(s.total)}`));
+        }))),
+    ];
+  }
+
+  // PLAY, and the short-lived phases either side of it that all show a table.
+  const plays = pub.plays || [];
+  // THE SWEEP IS A SEPARATE STATE INSIDE PLAY, not a separate phase — the
+  // engine holds a completed trick on the table for TRICK_PAUSE_MS so the
+  // table can see what happened, and refuses every play during it. On a TV
+  // that pause is the most important frame of the trick, because it is the
+  // only one where "who took it" is shown, so it gets its own sentence and
+  // its own highlight rather than flicking straight to the next lead.
+  const winner = pub.sweeping && pub.lastTrick ? pub.lastTrick.winner : null;
+  return [
+    el('p', { class: 'tv-lede' }, winner !== null
+      ? [el('b', {}, nameOf(winner)), ' takes it']
+      : [el('b', {}, nameOf(pub.turnSeat)), ' to play']),
+    el('div', { class: 'tv-trick' },
+      // An empty trick still renders one face-down card rather than nothing,
+      // so the row does not collapse and the whole board jump upward between
+      // the last card of one trick and the first of the next.
+      (plays.length ? plays : [null]).map((p) => (p === null
+        ? el('div', { class: 'tv-play' },
+          el('span', { class: 'card card-back' }), el('span', { class: 'who' }, '·'))
+        // `code`, NOT `card`. The engine's play record is { seat, code } — the
+        // sketch was written against the guess and rendered a table of card
+        // backs, which is the reason the sketch existed.
+        : el('div', {
+          class: `tv-play${p.seat === pub.leadSeat ? ' lead' : ''}${p.seat === winner ? ' win' : ''}`,
+        }, cardFace(p.code), el('span', { class: 'who' }, nameOf(p.seat)))))),
+    el('p', { class: 'tv-lede' }, `Trick ${pub.trickIndex + 1} of ${pub.roundSize}`),
+  ];
 }
 
 // ###########################################################################

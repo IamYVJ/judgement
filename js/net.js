@@ -136,6 +136,12 @@ import {
   validPlayerId, validName, validClientId, validPublicState, validPrivateState,
 } from './guards.js';
 import { normalizeCode, CODE_LENGTH } from './util.js';
+// The only thing this file wants from the rules, and it wants it for
+// arithmetic rather than for play: how many seats there are decides how much
+// of the connection budget has to stay available to fill them. rules.js is
+// already in this module's graph through guards.js, so this adds an edge that
+// was there and no module to the shell.
+import { MAX_PLAYERS } from './rules.js';
 
 // Set to null to use PeerJS's default public cloud broker. Replace with an
 // object (see the header) to self-host signalling for offline LAN play.
@@ -166,6 +172,35 @@ export const BROKER_CONFIG = null;
  * asked to hold open at once, which is the failure that actually happens.
  */
 export const MAX_HOST_CONNS = 32;
+
+/**
+ * How many of those connections may be WATCHERS — devices that want the board
+ * and no seat.
+ *
+ * A watcher is an ordinary connection: it is accepted, it is counted, it holds
+ * an RTCPeerConnection open. So without a ceiling of its own, watching and
+ * playing compete for the same thirty-two, and the loser is whichever arrives
+ * second. That is the wrong way round. A table with nobody able to join is not
+ * a table; a table with the ninth screen turned away is a table.
+ *
+ * The reservation is the arithmetic the paragraph above already does in prose:
+ * six remote players at up to four connections each during churn is
+ * twenty-four, so twenty-four is what is held back and the remainder is what
+ * watchers may have. Written as the subtraction rather than as the answer,
+ * because the answer is only correct given today's MAX_PLAYERS and the whole
+ * point of the note above is that this moves when that does.
+ *
+ * Eight is far more screens than a card game around one table has. It is not
+ * chosen to be generous, it is what is left.
+ *
+ * THIS IS NOT AN ANTI-ABUSE CONTROL EITHER, for the same reason MAX_HOST_CONNS
+ * is not: anyone with the code can open connections and simply never say what
+ * they are, and those cost a slot without ever reaching this number. What this
+ * stops is the honest version — a game people actually want to watch — from
+ * locking its own players out.
+ */
+const CONNS_PER_PLAYER = 4;
+export const MAX_WATCHERS = MAX_HOST_CONNS - CONNS_PER_PLAYER * (MAX_PLAYERS - 1);
 
 /**
  * How many refused frames a connection may send before it is closed.
@@ -351,6 +386,7 @@ export function connIdForPlayer(playerId) {
 // ---------------------------------------------------------------------------
 export const WIRE = Object.freeze({
   JOIN: 'join',          // client -> host, once per connection, on open
+  WATCH: 'watch',        // client -> host, once per connection, on open
   STATE: 'state',        // host -> client, on every change
   REJECTED: 'rejected',  // host -> client, a refusal meant for the sender alone
   REPLACED: 'replaced',  // host -> client, last words: your seat moved elsewhere
@@ -393,6 +429,39 @@ export function readJoinFrame(msg) {
   if (name === null) return null;
   return { name, clientId: validClientId(msg.clientId) };
 }
+
+/**
+ * A watcher's hello. It carries nothing, and both halves of that are choices.
+ *
+ * A SEPARATE FRAME TYPE, NOT `watch: true` ON THE HELLO ABOVE. As a flag it
+ * would have to survive readJoinFrame(), which refuses a frame with no usable
+ * name — so either every watcher invents a name nobody will ever read, or that
+ * refusal grows an exception and the one rule protecting the seat list from
+ * blank names gets a hole in it. Neither is worth it for a field that is
+ * constant. Two frame types stay two straight lines.
+ *
+ * NO clientId EITHER. A clientId exists to reclaim a seat, and a watcher has
+ * no seat to reclaim; sending one would only hand the host a stable device
+ * fingerprint for a device it never needs to recognise again. A watcher that
+ * drops and comes back is simply a new watcher, which costs nothing because
+ * the first state frame carries the whole board.
+ */
+export function watchFrame() {
+  return { type: WIRE.WATCH };
+}
+
+/** Whether a frame is a watcher's hello. There is nothing to read out of it,
+ *  so this is a predicate rather than a reader — a reader returning `{}` would
+ *  invite a caller to look for fields that are never coming. */
+export function isWatchFrame(msg) {
+  return !!msg && msg.type === WIRE.WATCH;
+}
+
+/** The `identity` to hand joinHost() for a connection that wants the board and
+ *  no seat. A shared frozen value rather than `{ watch: true }` written out at
+ *  the call site, so that "a watcher carries no name and no clientId" is stated
+ *  once here instead of being true by accident at each caller. */
+export const WATCHER = Object.freeze({ watch: true });
 
 /**
  * One device's state frame. Pure, and exported for exactly one reason: it is
@@ -630,6 +699,7 @@ function attachBrokerRecovery(peer, handlers = {}) {
  *
  * handlers: onOpen(code), onConnect(playerId),
  *           onJoin(playerId, { name, clientId } | null),
+ *           onWatch(playerId, accepted),
  *           onData(playerId, msg), onDisconnect(playerId), onError(err),
  *           onBrokerDown(), onBrokerUp(), onBrokerLost()
  *
@@ -643,6 +713,21 @@ function attachBrokerRecovery(peer, handlers = {}) {
  * `null` case of onJoin is a hello that arrived and was unusable — the caller
  * should tell the sender why, because a joiner who is dropped in silence sits
  * on a spinner until their own deadline expires.
+ *
+ * onWatch is the same split again for a connection that wants the board and no
+ * seat. Its second argument is false when the watcher was turned away for want
+ * of a slot (see MAX_WATCHERS) — the refusal is reported rather than acted on
+ * here, because a refusal is a sentence for a human and this file does not
+ * write sentences.
+ *
+ * Note what a watcher does NOT change. It is an ordinary connection in every
+ * other respect, so it counts against MAX_HOST_CONNS, it gets its own token
+ * bucket, and pushState() already reaches it with `priv: null` because it has
+ * no seat. That is most of this feature, and it was here before the feature
+ * was — which is also the reason WIRE.WATCH is worth having at all. A watcher
+ * that simply never said hello would already work; it would just be
+ * indistinguishable from a player still typing their name, and a host that
+ * cannot tell the two apart cannot keep the second one's chair free.
  */
 export function createHost(code, handlers = {}) {
   if (!peerAvailable()) return inertTransport(handlers, PEER_MISSING, { connections: new Map() });
@@ -656,6 +741,7 @@ export function createHost(code, handlers = {}) {
   const attached = new Set();     // every conn accepted, open or still opening
   const recovery = attachBrokerRecovery(peer, handlers);
   let refusedTotal = 0;
+  let watchers = 0;               // connections that have declared themselves watchers
 
   // The code handed back is the NORMALISED one, because that is the address
   // actually being listened on. A host that typed nothing and was given a code
@@ -705,6 +791,16 @@ export function createHost(code, handlers = {}) {
     // connection, which is what a reconnecting device does anyway.
     let joinedAs = null;
     let joined = false;
+
+    // The same rule one step wider: a connection is a PLAYER OR A WATCHER, and
+    // whichever it declares first it stays for its life. The reasoning is the
+    // one above, arrived at from the other end — a connection that watches and
+    // then joins would be sitting in a seat the host believes is unseated, and
+    // one that joins and then watches would leave a seat marked connected with
+    // nothing behind it. Either way the table waits on a turn that will never
+    // come. Switching sides means opening a new connection, which is what
+    // changing your mind on the join screen already does.
+    let watching = false;
 
     // See HANDSHAKE_BUDGET_MS. Cleared the moment the connection opens, so a
     // live connection is never touched by it.
@@ -772,7 +868,32 @@ export function createHost(code, handlers = {}) {
         return;
       }
 
+      // Before JOIN, because the two are mutually exclusive and the guard
+      // reads better in the order it is decided: what kind of connection is
+      // this, and only then, whose.
+      if (isWatchFrame(msg)) {
+        if (joined) { refuse(); return; }
+        // A repeated watch hello is a retry and costs nothing, so it is not
+        // refused — but it is not counted twice either, or a client with a
+        // stutter would eat the whole watcher budget by itself.
+        if (watching) return;
+        if (watchers >= MAX_WATCHERS) {
+          // NOT refuse(). That counter is for frames a legitimate client would
+          // never send, and this is the most legitimate frame there is — it
+          // simply arrived when the room was full. Closing the connection over
+          // it would also be wrong: the sender is still free to take a SEAT,
+          // since the seats are exactly what was being held back for them.
+          if (handlers.onWatch) handlers.onWatch(playerIdForConn(conn.peer), false);
+          return;
+        }
+        watching = true;
+        watchers += 1;
+        if (handlers.onWatch) handlers.onWatch(playerIdForConn(conn.peer), true);
+        return;
+      }
+
       if (msg.type === WIRE.JOIN) {
+        if (watching) { refuse(); return; }
         const hello = readJoinFrame(msg);
         // A hello with no usable name never reaches the engine, but the caller
         // is told, so the sender can be told.
@@ -784,12 +905,26 @@ export function createHost(code, handlers = {}) {
         return;
       }
 
+      // A watcher's intents are NOT filtered here, deliberately. The engine
+      // refuses them already — an unseated connection is seat −1, which every
+      // guard in state.js checks — and a second opinion about legality is a
+      // second thing to get wrong, and the one that gets it wrong is the one
+      // nobody tests. What holds it up is a property in the suite, not a line
+      // in this file.
       if (handlers.onData) handlers.onData(playerIdForConn(conn.peer), msg);
     });
 
     const drop = () => {
       stopReaper();
       attached.delete(conn);
+      // GIVE THE WATCHER SLOT BACK, exactly once. Both 'close' and 'error' run
+      // this, and an error is usually followed by a close, so a bare decrement
+      // would run twice and hand out a slot that was never taken — eight
+      // watchers becoming nine, then ten, which is the ceiling quietly
+      // dissolving rather than failing. The flag is the once-only guard as
+      // well as the count's source, and clearing it here cannot re-open the
+      // door to a JOIN because nothing arrives on a channel that has closed.
+      if (watching) { watching = false; watchers -= 1; }
       // Only if THIS connection is the one currently seated. A stale connection
       // closing after a reconnect has already taken the seat must not fire a
       // disconnect against the seat that was just handed back.
@@ -897,10 +1032,10 @@ export function createHost(code, handlers = {}) {
  * indistinguishable from a dropped connection and "reconnect" is the right
  * answer to that one.
  *
- * `identity` is { name, clientId }. When it is given — which is every real
- * call — the JOIN frame is sent by this function, on open, before onOpen fires,
- * and exactly once per connection. That is not a convenience: it is what makes
- * "the ticket travels" a property of the transport rather than of whoever
+ * `identity` is { name, clientId }, or WATCHER. When it is given — which is
+ * every real call — the hello is sent by this function, on open, before onOpen
+ * fires, and exactly once per connection. That is not a convenience: it is what
+ * makes "the ticket travels" a property of the transport rather than of whoever
  * remembered to write the line. Pass nothing to open a connection that says
  * nothing, which only a probe wants.
  *
@@ -932,7 +1067,11 @@ export function joinHost(code, handlers = {}, identity = null) {
     conn = peer.connect(hostId, { reliable: true });
 
     conn.on('open', () => {
-      if (identity) trySend(conn, joinFrame(identity.name, identity.clientId));
+      // The branch is on the identity, not on a separate argument, because the
+      // two are the same question: who is this connection? A watcher is an
+      // identity with nothing in it.
+      if (identity && identity.watch) trySend(conn, watchFrame());
+      else if (identity) trySend(conn, joinFrame(identity.name, identity.clientId));
       if (handlers.onOpen) handlers.onOpen();
     });
 
