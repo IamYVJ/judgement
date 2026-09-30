@@ -123,6 +123,16 @@
        recovery control that depends on the thing it recovers from is not a
        recovery control. -->
   <button type="button" class="footer-reset" id="reset-btn">Clear cache &amp; reload</button>
+
+  <!-- THE VISITOR FOOTNOTE. `hidden` until the shell script at the bottom of
+       this file has a real number back from GoatCounter, and it stays hidden
+       on every failure — an adblocker, offline, a path with no views yet — so
+       a failure leaves nothing on the page rather than a bare "— visitors".
+       css/app.css must never give it a `display`: any value beats `hidden`.
+       Last in the footer so it wraps onto a line of its own. -->
+  <p class="visitor-counter" hidden>
+    <span id="visitor-count" class="visitor-count">—</span> visitors
+  </p>
 </footer>
 
 <!-- 3. THE RULES SHEET — survives because it is static prose and a <dialog>.
@@ -217,6 +227,56 @@
     });
   }
 
+  // -- Visitor count -------------------------------------------------------
+  // Fills in the footer's "N visitors" footnote. Decorative, so it stays
+  // hidden on every failure: an adblocker, offline, a brand-new path with no
+  // data yet, or the "visitor counts" setting turned off in GoatCounter.
+  function showVisitorCount() {
+    var box = document.querySelector('.visitor-counter');
+    var out = document.getElementById('visitor-count');
+    if (!box || !out) return;
+
+    // Read the endpoint off the beacon tag so the site URL lives in one place.
+    var tag = document.querySelector('script[data-goatcounter]');
+    var endpoint = tag && tag.getAttribute('data-goatcounter');
+    if (!endpoint) return;
+
+    // This page's path only. Never /counter/TOTAL.json, which sums every
+    // project on the shared site. pathname WITHOUT location.search, on
+    // purpose: a TV opened from a ?watch= link is recorded under the longer
+    // path, and asking for exactly that path would 404 and hide the footnote.
+    var path = window.location.pathname;
+
+    // A fixed date before this project's first pageview. All-time is the
+    // default, so this does not change the count; it gives the response its
+    // own cache key, so a 404 cached before the first view ever landed cannot
+    // keep the footnote hidden for hours after it.
+    var START = '2026-01-01';
+
+    var base = endpoint.replace(/\/count$/, '');
+    fetch(base + '/counter/' + encodeURIComponent(path) + '.json?start=' + START)
+      .then(function (res) {
+        return res.ok ? res.json() : Promise.reject(new Error('bad status'));
+      })
+      .then(function (data) {
+        // `count` is already a formatted string: render it as-is. GoatCounter
+        // caches this response for ~4h, so a fresh visit won't move it at once.
+        if (data && data.count != null) {
+          out.textContent = String(data.count);
+          box.hidden = false;
+        }
+      })
+      .catch(function () { /* decorative: stay hidden */ });
+  }
+
+  // This runs while the parser is still inside <body>, before it has reached
+  // the beacon tag below, so the lookup above would find nothing yet. Wait.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', showVisitorCount, { once: true });
+  } else {
+    showVisitorCount();
+  }
+
   // -- Clear cache & reload ------------------------------------------------
   var btn = document.getElementById('reset-btn');
   if (!btn) return;
@@ -271,6 +331,23 @@
   });
 }());
 </script>
+
+<!-- GoatCounter pageview beacon. One site shared across all projects on purpose:
+     counts are per-path, so each project is separated by its own pathname.
+     LAST IN <body> AND async, so it never delays the game.
+
+     https: written out rather than the protocol-relative //gc.zgo.at, which a
+     file:// double-click would resolve to file://gc.zgo.at — and which
+     scripts/test-engine.mjs would rightly read as a local path that is not
+     relative and not in the repo.
+
+     sw.js never answers it: it is cross-origin, and the worker hands every
+     cross-origin request straight to the network. A beacon answered from
+     cache records nothing. -->
+<script
+  data-goatcounter="https://yvj.goatcounter.com/count"
+  async
+  src="https://gc.zgo.at/count.js"></script>
 
 </body>
 </html>

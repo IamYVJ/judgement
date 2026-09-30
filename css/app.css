@@ -1012,6 +1012,14 @@ tbody tr.now td { background: var(--accent-dim); }
   border-radius: 7px; padding: 7px 9px; color: var(--muted);
 }
 
+/* The visitor footnote: a centred line of its own under the row above, in the
+   footer's own fine print. flex-basis, NOT anything on `display` — any display
+   value beats the [hidden] attribute and would show a bare "— visitors" to
+   everyone whose adblocker stops GoatCounter. The number takes --text, the
+   way .totals and .tv-bar pick out their numbers from a --muted label. */
+.visitor-counter { flex-basis: 100%; margin: 0; text-align: center; }
+.visitor-count { font-variant-numeric: tabular-nums; color: var(--text); }
+
 /* The footer is chrome, and the play screen has none: the strip and the dock
    are pinned to the two edges and a footer under them would either steal the
    dock's space or scroll the board. Hidden by a class main.js sets on <body>

@@ -10989,13 +10989,19 @@ section('The shell: every asset shipped, and every asset cached');
   // `null` back from fire() means respondWith was never called, which is the
   // worker handing the request to the browser untouched.
 
-  // THE BEACON. Three different third parties, all of which must pass
-  // straight through. The signalling one is the dangerous one: a cached
-  // handshake response is a room code that dials a dead conversation.
+  // THE BEACON. Every kind of third party the page talks to, all of which
+  // must pass straight through. The signalling one is the dangerous one: a
+  // cached handshake response is a room code that dials a dead conversation.
+  // The last three are GoatCounter — the script, the pageview, and the
+  // footer's visitor count — where a cached answer records nothing and shows
+  // a number that never moves.
   const foreign = [
     'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
     'https://fonts.gstatic.com/s/inter/v13/x.woff2',
     'https://0.peerjs.com/peerjs/id?ts=1',
+    'https://gc.zgo.at/count.js',
+    'https://yvj.goatcounter.com/count?p=%2Fjudgement%2F',
+    'https://yvj.goatcounter.com/counter/%2Fjudgement%2F.json?start=2026-01-01',
   ];
   let intercepted = 0;
   for (const u of foreign) {
@@ -11004,6 +11010,12 @@ section('The shell: every asset shipped, and every asset cached');
     }
   }
   eq(intercepted, 0, 'not one cross-origin request is intercepted — the beacon is never touched');
+
+  // The analytics beacon must never be cached: a beacon answered from cache
+  // records nothing. The worker does not name either GoatCounter host at all,
+  // so no branch can route them and no list can precache them.
+  ok(!/gc\.zgo\.at|goatcounter/.test(swSrc.replace(/\/\/[^\n]*/g, '')),
+    'the analytics beacon is not routed or precached by the worker');
 
   // And nothing cross-origin ended up in the cache as a side effect.
   let foreignCached = 0;

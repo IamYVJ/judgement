@@ -83,7 +83,7 @@
 // worker does not precache itself, which is also the only reason this can be
 // computed at all — and the only reason `npm run stamp` can write to this file
 // without moving the target it just measured.
-const SHELL_STAMP = 'c620a426ac21';
+const SHELL_STAMP = 'be422a23617f';
 
 // The stamp is the version. Keeping the 'judgement-shell-' prefix matters —
 // the activate handler below deletes caches by it, and deleting by prefix is
@@ -219,10 +219,11 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   // CROSS-ORIGIN GOES STRAIGHT TO THE NETWORK, ALWAYS. The PeerJS bundle, the
-  // fonts, the STUN/TURN servers and every byte of signalling traffic are all
-  // somebody else's origin. See the header: this is the beacon rule, and it is
-  // enforced here rather than by an allowlist because an allowlist is a list
-  // of the third parties you thought of.
+  // fonts, the GoatCounter beacon and its visitor count, the STUN/TURN servers
+  // and every byte of signalling traffic are all somebody else's origin. See
+  // the header: this is the beacon rule, and it is enforced here rather than
+  // by an allowlist because an allowlist is a list of the third parties you
+  // thought of.
   let url;
   try {
     url = new URL(req.url);
