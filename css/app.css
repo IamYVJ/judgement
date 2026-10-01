@@ -1055,6 +1055,14 @@ body.in-play .site-footer { display: none; }
      so that a seven-card trick and a three-card trick read the same from the
      same distance. */
   container-type: size;
+  /* AND THEREFORE A HEIGHT OF ITS OWN, the same one .shell-play has. Size
+     containment makes the content height zero, so without this the box only
+     reaches the bottom of the screen by flex-growing inside #app — whose
+     height is indefinite, because body has min-height and not height. The box
+     still lays out full-screen, but Chromium resolves cqh against the
+     indefinite height and gets 0: every font, card and button on this screen
+     computes to zero and the TV is a blank page with the right DOM in it. */
+  height: 100dvh;
   position: relative;
   flex: 1 1 auto;
   min-height: 0;

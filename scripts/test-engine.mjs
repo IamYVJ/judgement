@@ -5798,6 +5798,42 @@ section('UI: the play shell can shrink, so the hand stays on the screen');
 }
 
 // ===========================================================================
+section('UI: a size container has a height of its own, or cqh is zero');
+// ===========================================================================
+//
+// `container-type: size` is what lets a rule say `font-size: 3.4cqh`, and it
+// costs the container its content height: size containment makes that zero.
+// So the height has to come from somewhere other than the children, and
+// flex-growing inside an indefinite parent is not it. #app is such a parent —
+// body has min-height, not height — and there the box still LAYS OUT full
+// screen while Chromium resolves cqh against the indefinite height: 0.
+//
+// THE TV SHIPPED LIKE THAT. Every font, card and button on it is in cqh, so
+// every one computed to 0px and a watcher saw a blank screen — with the right
+// DOM in it, the right state in it, and a green suite, because the DOM shim
+// has no layout and the spectator section only asks about frames. Found in a
+// browser: inside .tv, 10cqh was 0px while 10cqw was 75px.
+//
+// DERIVED, not listed: every rule that declares container-type: size is held
+// to this, so the next size container cannot ship the same blank screen.
+{
+  const rules = cssRules('css/app.css');
+  const sized = rules.filter((r) => !r.at && /(^|;)\s*container-type\s*:\s*size\s*(;|$)/.test(r.body));
+  ok(sized.length >= 1, `found ${sized.length} size container(s) in app.css, so the sweep is not empty`);
+
+  // A height that does not lean on the parent's: a viewport unit or a length.
+  // Not auto, not a percentage of something indefinite, and not missing.
+  const DEFINITE = /^\d+(\.\d+)?(dvh|svh|lvh|vh|px|rem|em)$/;
+  const blank = [];
+  for (const r of sized) {
+    const h = cssDecl(rules, r.sel, 'height');
+    if (!h || !DEFINITE.test(h)) blank.push(`${r.sel} (height: ${h || 'none'})`);
+  }
+  for (const b of blank) console.error(`  ✗ FAIL: ${b} is a size container with no definite height — its cqh is 0`);
+  eq(blank.length, 0, 'every size container declares a definite height, so cqh is not zero');
+}
+
+// ===========================================================================
 section('UI: it renders every phase, from every seat, without throwing');
 // ===========================================================================
 
