@@ -24,8 +24,11 @@
 //   error     string | null               the last refusal, already humanised
 //   selected  card code | null            tapped, not yet played
 //   selectedBid number | null             tapped, not yet submitted
+//   left      { role, code } | null       a table this device walked away from
+//                                         and can go back to — the home card
 //   showPad   boolean                     the full score pad is open
 //   showLog   boolean                     the log drawer is open
+//   showLeave boolean                     the "leave the game?" sheet is open
 //   announce  string                      copied into #announce by main.js
 //   busy      boolean                     an intent is in flight
 //   reconnecting / netWarning             transport noise, drawn over the top
@@ -41,10 +44,13 @@
 // host')` in js/state.js) without any device changing role.
 //
 // So: every owner-only control in here is gated on `priv.isOwner`, never on
-// `app.isHost`. The only thing gated on isHost is the room code, because that
-// is a property of the device that is listening. Getting this backwards
-// produces a lobby where the person who happens to be hosting can change the
-// rules out from under the owner, and it looks completely normal.
+// `app.isHost`. Two things are keyed to isHost and both are facts about the
+// device rather than permissions: the room code, because this is the device
+// that is listening on it, and what the LEAVE sheet says will happen, because
+// this is the device the game stops with. Neither decides what anybody may
+// DO — leaving is open to everyone. Getting this backwards produces a lobby
+// where the person who happens to be hosting can change the rules out from
+// under the owner, and it looks completely normal.
 //
 // ---------------------------------------------------------------------------
 // WHAT THIS FILE IS NOT ALLOWED TO KNOW
@@ -109,6 +115,10 @@ export function render(root, app, intents) {
   // visible behind them rather than being replaced by them.
   if (app.showPad && app.pub) root.appendChild(padOverlay(app, intents));
   if (app.showLog && app.pub) root.appendChild(logOverlay(app, intents));
+  // Above the other two, because it is the one that asks a question. And only
+  // over a table: the flag outliving the game screen would otherwise put "are
+  // you sure you want to leave?" on top of the screen you left to.
+  if (app.showLeave && app.pub && app.screen === 'game') root.appendChild(leaveOverlay(app, intents));
   if (app.reconnecting) root.appendChild(reconnectBanner(app));
   else if (app.netWarning) root.appendChild(netBanner(app, intents));
 }
@@ -194,6 +204,15 @@ function backRow(label, onclick) {
     el('button', { class: 'btn btn-secondary', onclick }, label));
 }
 
+// The full-width way out, for the screens with room to spell it. It OPENS THE
+// SHEET and does not leave — same intent as the ✕ in the play strip, so that
+// there is one confirmation in the app and every route to it is the same
+// route. Ghost, because on every screen it appears it sits under the button
+// the screen is actually for.
+function leaveBtn(intents, label) {
+  return el('button', { class: 'btn btn-ghost btn-wide', onclick: () => intents.toggleLeave() }, label);
+}
+
 // ###########################################################################
 //
 //  HOME, JOIN, AND THE DEAD ENDS
@@ -209,11 +228,54 @@ function nameField(app, intents) {
   });
 }
 
+/**
+ * The way back to a table this device walked away from.
+ *
+ * ABOVE THE NAME FIELD, NOT BELOW THE BUTTONS. Somebody who left a game and
+ * has opened the app again is far likelier to want that game than a new one,
+ * and the two buttons underneath both REPLACE it — there is one slot, and
+ * hosting or joining anything else writes over it. So the offer comes first
+ * and says what the alternative costs.
+ *
+ * The two roles get different words because they are different promises. A
+ * host is being offered the game itself: it is on this device and nowhere
+ * else, and DISCARD is the end of it for everyone. A player is being offered a
+ * seat somebody else is keeping, which is only there while that table is, so
+ * the card does not promise more than "while the game is on".
+ *
+ * NOT GATED ON A NAME, unlike the buttons below. Neither path needs one typed:
+ * a resumed host is seated from the snapshot, and a returning player is found
+ * by this device's ticket and keeps the name the table already knows.
+ */
+function leftCard(app, intents) {
+  const table = app.left;
+  if (!table) return null;
+  const hosting = table.role === 'host';
+  return el('div', { class: 'panel' },
+    el('h2', {}, hosting ? 'Your game is waiting' : 'You left a game'),
+    el('p', {}, hosting
+      ? `Room ${table.code} is paused on this device, exactly where you left it. `
+        + 'Resume it and the others rejoin with the same code.'
+      : `Your seat in room ${table.code} is kept for this device while the game is on. `
+        + 'Rejoin and it is yours again.'),
+    el('div', { class: 'btn-row' },
+      el('button', { class: 'btn btn-primary', onclick: () => intents.resumeTable() },
+        hosting ? 'RESUME GAME' : `REJOIN ${table.code}`),
+      el('button', { class: 'btn btn-ghost', onclick: () => intents.forgetTable() },
+        hosting ? 'DISCARD' : 'FORGET IT'),
+    ),
+    el('p', { class: 'hint' }, hosting
+      ? 'Discarding it ends the game for everyone. So does hosting or joining another one.'
+      : 'JOIN A GAME with the same code gets you back there too.'),
+  );
+}
+
 function homeScreen(app, intents) {
   const named = !!(app.me.name || '').trim();
   return shell(
     wordmark(intents),
     el('p', { class: 'tagline' }, 'Bid exactly. Take exactly. Anything else is nothing.'),
+    leftCard(app, intents),
     el('div', { class: 'panel' },
       nameField(app, intents),
       el('div', { class: 'btn-row' },
@@ -310,11 +372,23 @@ function hostLeftScreen(app, intents) {
     wordmark(intents),
     el('div', { class: 'panel' },
       el('h2', {}, 'Host left'),
-      // Peer-to-peer means the engine lived on their device and went with it.
-      // There is nothing to rejoin, and saying so is kinder than a retry
-      // button that can never succeed.
-      el('p', {}, 'The game ran on the host’s phone, so it has gone with them. Thanks for playing.'),
-      backRow('‹ BACK HOME', intents.goHome),
+      // Peer-to-peer means the engine lives on their device and stops with it.
+      //
+      // This used to say the game had GONE with them, and offered no way back
+      // because there was none: a retry button that can never succeed is worse
+      // than no button. That changed when a host became able to put a game
+      // down and resume it — the same code now leads back to the same table,
+      // with every seat where it was. So the screen says what is true, which
+      // is that it depends on them, and offers the one thing this device can
+      // do about it. If they have not come back the dial fails in a sentence
+      // and nothing is lost by having tried.
+      el('p', {}, 'The game runs on the host’s device, so it stops when they go. '
+        + 'If they come back to it, rejoin and you pick up where it stopped.'),
+      el('div', { class: 'btn-row' },
+        el('button', { class: 'btn btn-primary', onclick: () => intents.rejoin() },
+          app.code ? `REJOIN ${app.code}` : 'REJOIN'),
+        el('button', { class: 'btn btn-secondary', onclick: intents.goHome }, '‹ BACK HOME'),
+      ),
     ),
     liveRegion(app.announce),
   );
@@ -323,12 +397,13 @@ function hostLeftScreen(app, intents) {
 /**
  * The seat went to another tab on this same device.
  *
- * SIBLING OF hostLeftScreen, NOT A VARIANT OF IT, and for the same reason it
- * exists at all: both are terminal, and the thing that makes them terminal is
- * that there is nothing useful to press. A "RECONNECT" button here would be a
- * button whose entire effect is to take the seat off the tab that currently
- * has it and hand this one the same screen — the loop the whole fix is about,
- * with a finger on it. So there is one action and it goes home.
+ * TERMINAL, AND UNLIKE hostLeftScreen IT STAYS THAT WAY. The two used to be
+ * siblings — nothing useful to press on either — and then a host became able
+ * to resume, which gave that screen something worth dialling. This one still
+ * has nothing: a "RECONNECT" button here would be a button whose entire effect
+ * is to take the seat off the tab that currently has it and hand this one the
+ * same screen — the loop the whole fix is about, with a finger on it. So there
+ * is one action and it goes home.
  *
  * The wording names the cause rather than the symptom. "Disconnected" is true
  * and useless; somebody who does not know they have two tabs open cannot act
@@ -644,6 +719,11 @@ function lobbyScreen(app, intents) {
       // The engine's own sentence, not a second copy of the rule. If
       // startBlocker() gains a case, this shows it without being edited.
       blocker && owner && el('p', { class: 'hint' }, blocker),
+      // The lobby had no way out at all — not for a guest who joined the wrong
+      // table, and not for a host who changed their mind. It opens the same
+      // sheet the strip does, because what leaving DOES differs by who is
+      // asking and the sheet is where that is said.
+      leaveBtn(intents, 'LEAVE THE TABLE'),
     ),
     errorNote(app),
     liveRegion(app.announce),
@@ -976,6 +1056,22 @@ function playStrip(app, intents) {
       // everyone on?" and "what am I allowed to do?" — the second is the one a
       // first-timer has, and this is the only screen they have it on.
       helpBtn(intents, 'help-btn help-btn-sm'),
+      // THE WAY OUT, and the strip is the only place it can go for the same
+      // reason the log's opener is here: this is the one thing on screen in
+      // every phase that has cards in it. Before it, a player mid-round could
+      // not leave at all — closing the tab was the only exit, and a reload
+      // puts you straight back in your seat.
+      //
+      // Last in the row and the quietest thing in it, because it is the one
+      // control here that is not a question about the trick. It opens a sheet
+      // and leaves nothing: a ✕ this close to PAD and LOG will be pressed by
+      // accident, and an accident must cost one more tap rather than a seat.
+      // A glyph and not the word, to stay off a second line at 375px — which
+      // is why it carries its name in aria-label and title.
+      el('button', {
+        class: 'strip-btn strip-exit', 'aria-label': 'Leave the game', title: 'Leave the game',
+        onclick: () => intents.toggleLeave(),
+      }, '✕'),
     ),
     el('div', { class: 'seats' }, seats),
   );
@@ -1340,6 +1436,9 @@ function roundOverScreen(app, intents) {
           onclick: () => intents.nextRound(),
         }, more ? 'NEXT ROUND' : 'FINISH')
         : el('p', { class: 'hint' }, 'Waiting for the owner to deal the next round.'),
+      // Between rounds is when people actually go, and this screen has no
+      // strip to carry the ✕.
+      leaveBtn(intents, 'LEAVE THE GAME'),
     ),
     errorNote(app),
     liveRegion(app.announce),
@@ -1383,7 +1482,13 @@ function matchOverScreen(app, intents) {
       priv && priv.isOwner
         ? el('button', { class: 'btn btn-primary btn-wide', onclick: () => intents.newMatch() }, 'PLAY AGAIN')
         : el('p', { class: 'hint' }, 'Waiting for the owner.'),
-      el('button', { class: 'btn btn-secondary btn-wide', onclick: intents.goHome }, 'LEAVE'),
+      // STRAIGHT TO leaveGame(), with no sheet in front of it. The sheet
+      // exists to say what leaving will cost, and here it costs nothing: the
+      // match is over and there is no seat to keep or game to pause. It is
+      // leaveGame() and not goHome() so that the table is still TOLD — a host
+      // who goes home from this screen takes the scoreboard off everybody
+      // else's, and they should see why rather than a reconnect spinner.
+      el('button', { class: 'btn btn-secondary btn-wide', onclick: () => intents.leaveGame() }, 'LEAVE'),
     ),
     liveRegion(app.announce),
   );
@@ -1483,6 +1588,68 @@ function padOverlay(app, intents) {
     el('div', { class: 'sheet-inner' },
       el('button', { class: 'sheet-close', 'aria-label': 'Close', onclick: () => intents.togglePad() }, '✕'),
       scorePad(app),
+    ));
+}
+
+// ###########################################################################
+//
+//  LEAVING
+//
+//  One sheet, in front of the one intent that cannot be taken back. It is the
+//  only place in the app that says what leaving DOES, and that is the whole
+//  reason it exists: the answer is different for every person who can ask.
+//
+// ###########################################################################
+
+/**
+ * What happens if this device leaves now, in a sentence.
+ *
+ * KEYED TO isHost, AND THAT IS NOT THE MISTAKE THE HEADER WARNS ABOUT. isOwner
+ * is who may change the game; isHost is whose phone the game is running on,
+ * and it is the second that decides whether six other people's screens stop.
+ * An owner who is not the host leaves like any other player. A host who is not
+ * the owner still takes the engine with them.
+ *
+ * The phase matters as much as the role. A match under way is PARKED by its
+ * host and a seat in it is KEPT for its player — those are the two promises
+ * js/main.js's leaveGame() actually keeps, and the wording follows that
+ * function case for case. A lobby has nothing to park and no seat worth
+ * keeping, and saying "your seat is kept" there would be promising a thing
+ * the engine is about to splice out of the table.
+ */
+function leaveConsequence(app) {
+  const { pub, priv } = app;
+  const underWay = pub.phase !== PHASES.LOBBY && pub.phase !== PHASES.MATCH_OVER;
+
+  if (app.isHost) {
+    return underWay
+      ? 'You are hosting, so the game stops for everyone while you are away. '
+        + 'It is kept on this device: RESUME on the home screen picks it up where it stopped, '
+        + `and the others rejoin room ${app.code}.`
+      : 'You are hosting, so this closes the table for everyone at it.';
+  }
+  // Connected and not seated: somebody who arrived after the deal. Nothing at
+  // the table changes when they go, and nothing is waiting for them if they
+  // come back.
+  if (!priv) return 'You do not have a seat at this table, so nothing changes for the players.';
+  if (!underWay) return 'Your seat is given up. The same code gets you back in while the table is open.';
+  return 'Your seat is kept, and a bot plays your cards while you are away. '
+    + `Rejoin room ${app.code} from this device to take it back.`;
+}
+
+function leaveOverlay(app, intents) {
+  return el('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Leave the game' },
+    el('div', { class: 'sheet-inner leave-sheet' },
+      el('button', { class: 'sheet-close', 'aria-label': 'Close', onclick: () => intents.toggleLeave() }, '✕'),
+      el('h2', {}, 'Leave the game?'),
+      el('p', {}, leaveConsequence(app)),
+      el('div', { class: 'btn-row' },
+        el('button', { class: 'btn btn-primary', onclick: () => intents.leaveGame() }, 'LEAVE'),
+        // The same toggle as the ✕, deliberately a second way to say no. The
+        // ✕ is where a thumb goes to dismiss a sheet; this is where an eye
+        // goes after reading the sentence above and deciding against it.
+        el('button', { class: 'btn btn-secondary', onclick: () => intents.toggleLeave() }, 'STAY'),
+      ),
     ));
 }
 

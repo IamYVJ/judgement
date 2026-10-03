@@ -1077,11 +1077,19 @@ export const OFFLINE_GRACE_MS = 10000;
  *  Two quite different situations with one answer. A bot has nobody behind it;
  *  an offline human has somebody behind it who is not there. Either way the
  *  table is waiting on a seat that cannot act for itself, and the alternative
- *  to acting is a dead game. */
+ *  to acting is a dead game.
+ *
+ *  AND A THIRD, WHICH IS THE SECOND WITH THE DOUBT REMOVED. A human who pressed
+ *  LEAVE is as absent as one whose phone died, but nobody has to wonder whether
+ *  they are about to come back — they said so. The grace period exists to hide
+ *  a tunnel, and there is no tunnel here, so the seat is paced like a bot's
+ *  instead of costing the table ten seconds on every one of its turns for the
+ *  rest of the match. It is still COVERED and not converted: the ticket takes
+ *  it back the same way, and js/state.js clears the flag when it does. */
 function coverage(seat) {
   if (!seat) return null;
   if (seat.isBot) return 'bot';
-  if (!seat.connected) return 'offline';
+  if (!seat.connected) return seat.left ? 'left' : 'offline';
   return null;
 }
 
@@ -1150,7 +1158,8 @@ export function createBotDriver({ thinkMs = BOT_THINK_MS, offlineMs = OFFLINE_GR
       //
       // `cover` is in it too, so a human who drops mid-pause restarts the
       // clock on the longer budget instead of inheriting a bot's second and a
-      // half.
+      // half. Only 'offline' gets that budget: a seat that LEFT is waited on
+      // exactly as long as a bot is.
       const key = [
         engine.phase, player.id, cover, engine.roundIndex, engine.trickIndex,
         engine.plays.length, engine.bids.filter((b) => b !== null).length,

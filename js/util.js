@@ -420,6 +420,49 @@ export function clearSession() {
 }
 
 /**
+ * The table this device walked away from ON PURPOSE and can still go back to,
+ * as `{ role, code }` — or null.
+ *
+ * A SESSION HAS TWO STATES AND ONE FLAG BETWEEN THEM. Without `left` it is
+ * live: the tab that wrote it was at the table, and a reload should put it
+ * back there without asking, because the commonest reason to reload is that
+ * something went wrong. With `left: true` it is parked: the player pressed
+ * LEAVE, and coming back is a thing they choose, on the home screen, with a
+ * button. Dragging them back into a game they just left because the page
+ * reloaded would make leaving impossible.
+ *
+ * So this is the question both of those places ask, in one function: boot asks
+ * it to decide whether to offer rather than resume, and going home asks it to
+ * decide whether there is anything worth keeping. Neither may answer it
+ * differently from the other, or the home screen would offer a table the
+ * loader then refuses.
+ *
+ * A PARKED HOST IS ONLY WORTH OFFERING WITH ITS SNAPSHOT. The record says where
+ * the game was; the snapshot IS the game. A "resume" button with nothing behind
+ * it opens an empty room on a code six people are about to redial.
+ *
+ * Everything is re-checked on the way out, because this is read back off disk:
+ * a code that no longer normalises to a code and a role that is not one of the
+ * two are both treated as no table at all, never as a table to dial.
+ *
+ * THE CODE MUST ALREADY BE A STRING, and that test is not redundant with the
+ * one after it. normalizeCode() stringifies whatever it is handed and keeps
+ * the characters that are in the alphabet — so an OBJECT in that slot becomes
+ * "[OBJECT OBJECT]", which has four alphabet letters in it, and comes out the
+ * other side as the perfectly well-formed room code BJEC. That is a RESUME
+ * button for a table nobody was ever at, on a code somebody else may be using.
+ */
+export function leftTable() {
+  const s = loadSession();
+  if (!s || s.left !== true) return null;
+  if (typeof s.code !== 'string') return null;
+  const code = normalizeCode(s.code);
+  if (code.length !== CODE_LENGTH) return null;
+  if (s.role === 'host') return loadEngineSnapshot() !== null ? { role: 'host', code } : null;
+  return s.role === 'client' ? { role: 'client', code } : null;
+}
+
+/**
  * The host's engine, as state.js's serialize() produced it.
  *
  * THIS CONTAINS EVERY HAND IN THE GAME, which is fine — it is written by the

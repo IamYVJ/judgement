@@ -85,6 +85,7 @@ import {
   CODE_LENGTH, generateRoomCode, normalizeCode, copyText,
   loadName, saveName, loadCode, saveCode, clientId, announcementFor,
   saveSession, loadSession, clearSession, saveEngineSnapshot, loadEngineSnapshot,
+  leftTable,
 } from '../js/util.js';
 import { render, seatState } from '../js/ui.js';
 // The transport, and the fake PeerJS that lets it be driven out here. Same
@@ -96,6 +97,7 @@ import {
   CONN_ID_PREFIX, HOST_ID, playerIdForConn, connIdForPlayer,
   WIRE, joinFrame, readJoinFrame, stateFrameFor, readStateFrame,
   rejectFrame, readRejectFrame, replacedFrame, isReplacedFrame,
+  leaveFrame, isLeaveFrame, hostLeftFrame, isHostLeftFrame,
   watchFrame, isWatchFrame, WATCHER, MAX_WATCHERS,
   peerAvailable, isFatalPeerError, describePeerError, createHost, joinHost,
 } from '../js/net.js';
@@ -2920,6 +2922,122 @@ section('The engine: seating, ownership and bots');
 }
 
 // ===========================================================================
+section('The engine: leaving on purpose, and the same ticket coming back');
+// ===========================================================================
+
+// A player who presses LEAVE and a player whose phone dies leave the engine in
+// the same place, on purpose: same chair, same hand, same score, same ticket,
+// and the same way back. The ONE thing that differs is a flag on the seat, and
+// the reason it exists is in js/bot.js — it decides how long the table waits
+// for that seat. So everything here is asserted as a COMPARISON between the two
+// ways of going, because "leaving keeps the seat" is only worth anything as
+// "leaving keeps exactly what dropping keeps".
+{
+  const mid = () => playMatchUntil({ config: UI_CONFIGS[0], players: 4 },
+    (e) => e.phase === PHASES.PLAY && e.plays.length > 0);
+
+  const dropped = mid();
+  const left = mid();
+  const seat = 2;
+  const id = dropped.seats[seat].id;
+  eq(left.seats[seat].id, id, 'the two tables are the same table, dealt from the same seed');
+  ok(dropped.seats.every((s) => s.left === false), 'nobody starts out having left');
+
+  const before = JSON.stringify(left.serialize());
+  const keep = (g) => ({
+    hand: g.hands[seat].slice(), bid: g.bids[seat], tricks: g.tricksWon[seat],
+    total: g.totals[seat], ticket: g.seats[seat].clientId, name: g.seats[seat].name,
+    seats: g.seats.length, phase: g.phase, turn: g.turnSeat, plays: g.plays.length,
+  });
+  const was = keep(left);
+
+  eq(dropped.disconnect(id).ok, true, 'one of them drops');
+  eq(left.disconnect(id, { left: true }).ok, true, 'and the other leaves on purpose');
+
+  same(keep(left), was, 'leaving on purpose keeps the chair, the hand, the bid, the score and the ticket');
+  same(keep(left), keep(dropped), 'which is exactly what dropping keeps — the two differ in nothing a player holds');
+  eq(left.seats[seat].connected, false, 'the seat is away');
+  eq(dropped.seats[seat].connected, false, 'as the dropped one is');
+  eq(left.seats[seat].left, true, 'and it is marked as having gone on purpose');
+  eq(dropped.seats[seat].left, false, 'which the dropped one is NOT — that flag is the whole difference');
+
+  // The table is told which, because the people still at it will want to know
+  // whether to wait.
+  const lastLine = (g) => g.log[g.log.length - 1];
+  eq(lastLine(left).text, `${was.name} left`, 'the log says they left');
+  eq(lastLine(dropped).text, `${was.name} disconnected`, 'where a drop says disconnected');
+  eq(lastLine(left).kind, lastLine(dropped).kind, 'under the same kind, so nothing downstream needs a new case');
+
+  // IT IS NOT ON THE WIRE. The flag is a pacing hint for the host's own driver
+  // and nothing a client needs — a seat that is away is drawn as away either
+  // way. Keeping it out of publicState() means guards.js has no new field to
+  // be suspicious of, which is the cheapest kind of validation there is.
+  eq('left' in left.publicState().seats[seat], false, 'publicState() does not publish the flag');
+  eq(left.publicState().seats[seat].connected, false, 'only that the seat is away, as before');
+
+  // --- and back again ------------------------------------------------------
+  // By ticket and by nothing else, from a connection id the engine has never
+  // seen — which is what a device that left and came back actually is.
+  const r = left.addPlayer('a-new-connection', 'Somebody Else Entirely', { clientId: was.ticket });
+  eq(r.ok, true, 'the ticket is let back in mid-match');
+  eq(r.seat, seat, 'into the chair it left');
+  eq(r.reclaimed, true, 'as a reclaim, not a new seat');
+  eq(left.seats[seat].connected, true, 'the seat is present again');
+  eq(left.seats[seat].left, false, 'and no longer marked as gone — the next absence is judged on its own');
+  eq(left.seats[seat].name, was.name, 'under the name the scoreboard already knows, whatever was typed');
+  same(keep(left), was, 'holding everything it went away with');
+  eq(left.privateStateFor('a-new-connection').hand.length, was.hand.length,
+    'and the new connection is sent that hand');
+  eq(left.privateStateFor(id), null, 'while the connection that left answers to no seat at all');
+
+  // A NAME IS STILL NOT A TICKET, and a seat that was left on purpose is the
+  // case where it is most tempting to make it one: the chair is empty, the
+  // name is on the scoreboard, and somebody is asking for it. That is exactly
+  // why it must not work — the scoreboard is public.
+  const gone = mid();
+  const victim = gone.seats[seat].name;
+  gone.disconnect(gone.seats[seat].id, { left: true });
+  const thief = gone.addPlayer('thief', victim, { clientId: 'not-the-ticket' });
+  eq(thief.ok, false, 'typing the name of a seat that left does not hand over the seat');
+  eq(gone.seats[seat].connected, false, 'which is still away');
+  eq(gone.privateStateFor('thief'), null, 'and the stranger is sent nobody\'s hand');
+
+  // --- the flag survives a host resume, because the absence did ------------
+  const parked = mid();
+  parked.disconnect(parked.seats[seat].id, { left: true });
+  const resumed = new GameEngine();
+  resumed.restore(JSON.parse(JSON.stringify(parked.serialize())));
+  eq(resumed.seats[seat].left, true, 'a seat that had left is still marked so after serialize → restore');
+  eq(resumed.seats.filter((s) => s.left).length, 1,
+    'and nobody else is: a restored host marks everyone away, but away is not the same as left');
+  eq(resumed.addPlayer('back', 'x', { clientId: parked.seats[seat].clientId }).seat, seat,
+    'and the ticket still takes that seat back from the resumed engine');
+
+  // --- the lobby, where there is nothing to keep ---------------------------
+  const lobbyA = new GameEngine(); const lobbyB = new GameEngine();
+  seatTable(lobbyA, ['Ana', 'Ben', 'Cleo', 'Dev']);
+  seatTable(lobbyB, ['Ana', 'Ben', 'Cleo', 'Dev']);
+  eq(lobbyA.disconnect('p2', { left: true }).removed, true, 'leaving a lobby vacates the chair');
+  lobbyB.disconnect('p2');
+  same(lobbyA.serialize(), lobbyB.serialize(), 'exactly as dropping out of one does — a lobby seat holds nothing');
+
+  // --- and the argument is not trusted ------------------------------------
+  // The second parameter arrives from main.js today and is a literal. It is
+  // read strictly anyway, because "truthy" is how a stray string from some
+  // later caller turns a tunnel into a goodbye.
+  for (const junk of [undefined, null, {}, 'left', true, { left: 'yes' }, { left: 1 }, { left: 'true' }]) {
+    const g = mid();
+    let threw = false;
+    try { g.disconnect(g.seats[seat].id, junk); } catch (_) { threw = true; }
+    eq(threw, false, `disconnect(id, ${JSON.stringify(junk)}) does not throw`);
+    eq(g.seats[seat].left, false, `and is a drop, not a goodbye`);
+    eq(g.seats[seat].connected, false, 'that still marks the seat away');
+  }
+
+  ok(before.length > 100, 'and all of it against a real mid-match engine');
+}
+
+// ===========================================================================
 section('The engine: the three presets, played end to end');
 // ===========================================================================
 
@@ -4971,6 +5089,77 @@ section('Bot — the driver, and the pacing the brief asks for');
       'and the covering move is a real bid the engine accepted');
   }
 
+  // #########################################################################
+  // #  A SEAT THAT LEFT ON PURPOSE IS PACED LIKE A BOT, NOT LIKE A TUNNEL.   #
+  // #                                                                       #
+  // #  The offline grace exists to hide a blip: ten seconds in which a      #
+  // #  phone coming out of a tunnel can take its own turn and nobody need   #
+  // #  ever know. Spent on a player who pressed LEAVE it hides nothing — it #
+  // #  is ten seconds of a stopped table, again on every one of that seat's #
+  // #  turns, for everyone who stayed. This is the entire reason the engine #
+  // #  records HOW a seat went, so it is asserted against the SHIPPED       #
+  // #  constants and as a difference between two otherwise identical        #
+  // #  tables — a version that covered both at the same pace, in either     #
+  // #  direction, fails it.                                                 #
+  // #########################################################################
+  {
+    const build = () => {
+      const table = new GameEngine();
+      table.addPlayer('a', 'A', { isOwner: true, clientId: 'ca' });
+      table.addPlayer('b', 'B', { clientId: 'cb' });
+      table.addPlayer('c', 'C', { clientId: 'cc' });
+      table.setConfig('a', { scoring: 'standard', trumpMethod: 'rotation', shape: 'downup', maxHand: 3 });
+      table.startMatch('a', 0);
+      let t = 0;
+      while (table.phase !== PHASES.BIDDING && t < 60000) { t += 100; table.tick(t); }
+      return { table, t, onMove: table.seats[table.turnSeat] };
+    };
+    const bidsIn = (g) => g.bids.filter((b) => b !== null).length;
+    ok(BOT_THINK_MS < OFFLINE_GRACE_MS,
+      `the two paces differ at all (${BOT_THINK_MS}ms against ${OFFLINE_GRACE_MS}ms), or there is nothing to tell apart`);
+
+    // The control: a seat that merely dropped waits out the whole grace.
+    const dropped = build();
+    dropped.table.disconnect(dropped.onMove.id);
+    const slow = createBotDriver();
+    eq(slow.tick(dropped.table, dropped.t), false, 'a dropped seat is not covered on the tick that notices it');
+    eq(slow.tick(dropped.table, dropped.t + BOT_THINK_MS + 1), false,
+      'nor after a bot\'s think time — a tunnel gets longer than that');
+    eq(slow.tick(dropped.table, dropped.t + OFFLINE_GRACE_MS - 1), false, 'nor a millisecond before the grace is up');
+    eq(bidsIn(dropped.table), 0, 'and nothing has been bid for it in all that time');
+    eq(slow.tick(dropped.table, dropped.t + OFFLINE_GRACE_MS), true, 'only when the whole grace has gone');
+
+    // The same seat, the same moment, gone ON PURPOSE.
+    const gone = build();
+    eq(gone.onMove.id, dropped.onMove.id, 'the two tables are waiting on the same seat');
+    gone.table.disconnect(gone.onMove.id, { left: true });
+    const quick = createBotDriver();
+    eq(quick.tick(gone.table, gone.t), false, 'a seat that left is not played instantly either');
+    eq(quick.tick(gone.table, gone.t + BOT_THINK_MS - 1), false,
+      'the table still gets a bot\'s pause to see whose turn it was');
+    eq(quick.tick(gone.table, gone.t + BOT_THINK_MS), true,
+      `but it is covered after ${BOT_THINK_MS}ms, not ${OFFLINE_GRACE_MS}ms`);
+    eq(bidsIn(gone.table), 1, 'with a real bid the engine accepted');
+
+    // COVERED, NOT CONVERTED — the promise the offline case makes, kept here
+    // too. The seat is still a human's, still holds its ticket, and the moment
+    // that ticket is back the driver has no business in it.
+    eq(gone.onMove.isBot, false, 'the seat is not turned into a bot');
+    ok(!!gone.onMove.clientId, 'and keeps the ticket that takes it back');
+
+    const back = build();
+    back.table.disconnect(back.onMove.id, { left: true });
+    eq(back.table.addPlayer('again', 'x', { clientId: back.onMove.clientId }).reclaimed, true,
+      'the ticket comes back before the driver has moved');
+    const idle = createBotDriver();
+    let moved = 0;
+    for (const at of [back.t, back.t + BOT_THINK_MS, back.t + OFFLINE_GRACE_MS, 86_400_000]) {
+      if (idle.tick(back.table, at)) moved += 1;
+    }
+    eq(moved, 0, 'and from then on the driver never plays that seat, however long it waits');
+    eq(bidsIn(back.table), 0, 'so the returning player bids for themselves');
+  }
+
   // And the other direction: stepping a phase nobody is waiting on is a no-op
   // rather than an error.
   const idle = new GameEngine();
@@ -5871,9 +6060,14 @@ section('UI: it renders every phase, from every seat, without throwing');
 {
   // --- the screen a superseded tab lands on --------------------------------
   //
-  // Two terminal screens now, and they are terminal for different reasons.
-  // 'hostleft' has nothing to reconnect TO. 'replaced' has somewhere very
-  // much alive to reconnect to, and must not.
+  // TERMINAL, AND NOW THE ONLY ONE OF ITS KIND. 'hostleft' used to be its
+  // sibling — nothing to reconnect TO — and this block asserted the two
+  // offered the same things. That stopped being true when a host became able
+  // to put a game down and resume it: the same code now leads back to the same
+  // table, so 'hostleft' offers a redial and is checked for it below.
+  // 'replaced' has somewhere very much alive to reconnect to, and must not.
+  // Its sibling is now the plain error screen, which is terminal for the
+  // dullest reason there is.
   // Draw a screen, press everything on it, and report what it was able to
   // ask for. `force` so that a disabled control still reports its intent —
   // the question here is what the screen OFFERS, not what it permits today.
@@ -5887,27 +6081,63 @@ section('UI: it renders every phase, from every seat, without throwing');
 
   const replaced = canDo('replaced');
   const hostleft = canDo('hostleft');
+  const dead = canDo('error');
   ok(replaced.controls > 0, `${replaced.controls} controls on the screen, so this is not an empty sweep`);
 
-  // SIBLING OF hostleft, ASSERTED AS ONE. Both are terminal; they should end
-  // in the same place. Stated as a comparison rather than as a list, because
-  // a list would have to be edited on the day the rules button moves and a
-  // comparison would not.
-  same(replaced.names, hostleft.names,
+  // SIBLING OF THE ERROR SCREEN, ASSERTED AS ONE. Both are terminal; they
+  // should end in the same place. Stated as a comparison rather than as a
+  // list, because a list would have to be edited on the day the rules button
+  // moves and a comparison would not.
+  same(replaced.names, dead.names,
     'it offers exactly what the other terminal screen offers, and nothing more');
   ok(replaced.names.includes('goHome'), 'including a way out');
 
-  // AND NOTHING THAT DIALS. Derived: whatever the two screens that can get
-  // onto the network offer and a terminal screen does not. A "RECONNECT" or
-  // "TRY AGAIN" button here would take the seat off the tab that currently
-  // holds it and hand this one the same screen — the loop the whole change
-  // is about, with a finger on it. It is exactly the button a future reader
+  // AND NOTHING THAT DIALS. Derived: whatever the screens that can get onto
+  // the network offer and a terminal screen does not. A "RECONNECT" or "TRY
+  // AGAIN" button here would take the seat off the tab that currently holds
+  // it and hand this one the same screen — the loop the whole change is
+  // about, with a finger on it. It is exactly the button a future reader
   // would think was missing, so the ban is a test and not a comment.
-  const onward = [...new Set([...canDo('home').names, ...canDo('join').names])]
-    .filter((n) => !hostleft.names.includes(n));
-  ok(onward.length >= 2, `${onward.length} intents belong to the screens that start connections: ${onward.join(', ')}`);
+  //
+  // 'hostleft' IS NOW ONE OF THOSE SCREENS, which makes this stricter than it
+  // was rather than looser: the redial that screen gained is in `onward`, so
+  // the day somebody copies its button across to this one, this fails.
+  const onward = [...new Set([
+    ...canDo('home').names, ...canDo('join').names, ...hostleft.names,
+  ])].filter((n) => !dead.names.includes(n));
+  ok(onward.length >= 3, `${onward.length} intents belong to the screens that start connections: ${onward.join(', ')}`);
   same(onward.filter((n) => replaced.names.includes(n)), [],
     'and the replaced screen offers none of them — there is no way to fight for the seat from here');
+
+  // --- and the screen a table lands on when its host goes -------------------
+  //
+  // ONE THING MORE THAN A DEAD END, AND EXACTLY ONE. The host may resume, and
+  // if they do the same code leads back to the same seat — so this screen
+  // offers the dial, and offers nothing else that the error screen does not.
+  // Derived by difference for the same reason as above: the day this screen
+  // grows a second button, the list of what it adds is the failure message.
+  same(hostleft.names.filter((n) => !dead.names.includes(n)), ['rejoin'],
+    'the host-left screen adds a way back to the table, and nothing else');
+  same(dead.names.filter((n) => !hostleft.names.includes(n)), [],
+    'and takes nothing away — it still goes home, and the rules are still one tap off');
+  ok(!replaced.names.includes('rejoin'), 'a way back that the replaced screen, by name, does not have');
+
+  // The button says WHERE, because the player may have been at more than one
+  // table today and "REJOIN" on its own asks them to remember which.
+  {
+    const { calls, intents } = spyIntents();
+    render(uiRoot, baseApp({ screen: 'hostleft', isHost: false, code: 'QRTX', pub: null, priv: null }), intents);
+    const btn = interactive(uiRoot).find((n) => { const b = calls.length; n.click(); return calls.slice(b).some((c) => c.name === 'rejoin'); });
+    ok(!!btn && btn.text.includes('QRTX'), 'the redial button names the room it will dial');
+    const said = walk(uiRoot).map((n) => (typeof n.text === 'string' ? n.text : '')).join(' ').toLowerCase();
+    // IT MUST NOT PROMISE. Whether there is a table to go back to is the
+    // host's decision and has not been made yet; the old wording said the game
+    // was gone, which is now false, and the opposite claim would be false the
+    // other way.
+    ok(/\bif\b/.test(said), 'the screen says the way back depends on the host, rather than promising it');
+    ok(!/thanks for playing|has gone with them/.test(said), 'and no longer says the game is gone for good');
+    ok(byClass(uiRoot, 'spinner').length === 0, 'with no spinner suggesting something is in progress');
+  }
 
   render(uiRoot, baseApp({ screen: 'replaced', isHost: false, pub: null, priv: null }), spyIntents().intents);
   const said = walk(uiRoot)
@@ -6875,6 +7105,9 @@ section('UI: everything reachable has a name, and every overlay a way out');
   sweepLobby((g, pub, priv, id) => {
     inspect(baseApp({ pub, priv, isHost: id === 'p0' }));
     if (priv) inspect(baseApp({ pub, priv: { ...priv, isOwner: true }, isHost: true }));
+    // The leave sheet is the third overlay, and in the lobby it is the only
+    // one — so without this frame the lobby contributes no sheets at all.
+    inspect(baseApp({ pub, priv, isHost: id === 'p0', showLeave: true }));
   });
 
   for (const config of UI_CONFIGS) {
@@ -6884,6 +7117,7 @@ section('UI: everything reachable has a name, and every overlay a way out');
           inspect(baseApp({ pub, priv, isHost: id === 'p0', showPad, showLog }));
         }
       }
+      inspect(baseApp({ pub, priv, isHost: id === 'p0', showLeave: true }));
     });
   }
 
@@ -6919,9 +7153,16 @@ section('UI: every drawer has a way IN, not just a way out');
 // need editing the day a screen gains or loses the strip, and would go stale
 // silently, which is the whole failure mode this file keeps running into.
 {
+  // THE LEAVE SHEET IS A DRAWER FOR EVERY PURPOSE THIS SECTION HAS, and it is
+  // in the list for the reason the list exists: its opener is in the play
+  // strip, so every frame with a strip in it must have one, and the sheet must
+  // be closable by pressing something. What it DOES once open is another
+  // question and has a section of its own further down — this one only says
+  // the door has a handle on both sides.
   const DRAWERS = [
     { name: 'the log', flag: 'showLog', toggle: 'toggleLog' },
     { name: 'the score pad', flag: 'showPad', toggle: 'togglePad' },
+    { name: 'the leave sheet', flag: 'showLeave', toggle: 'toggleLeave' },
   ];
 
   // Press everything; return the controls that fired `toggle`, along with
@@ -6945,7 +7186,7 @@ section('UI: every drawer has a way IN, not just a way out');
   const firstStuck = [];
 
   const check = (over, where) => {
-    const shut = baseApp({ ...over, showLog: false, showPad: false });
+    const shut = baseApp({ ...over, showLog: false, showPad: false, showLeave: false });
     const hasStrip = byClass(draw(shut).root, 'play-strip').length > 0;
     if (hasStrip) stripFrames++; else plainFrames++;
 
@@ -6980,7 +7221,7 @@ section('UI: every drawer has a way IN, not just a way out');
       // `.sheet-close` node; this one presses whatever is there and requires
       // that the toggle actually fires. A close button wired to the wrong
       // intent passes the first check and traps the player.
-      const open = baseApp({ ...over, showLog: false, showPad: false, [d.flag]: true });
+      const open = baseApp({ ...over, showLog: false, showPad: false, showLeave: false, [d.flag]: true });
       if (controlsFor(open, d.toggle).length === 0) {
         noWayOut[d.toggle]++;
         if (firstStuck.length < 8) firstStuck.push(`${d.name}, open, at ${where}`);
@@ -7043,6 +7284,236 @@ section('UI: every drawer has a way IN, not just a way out');
   // against two separately-rendered trees and the node objects cannot be ===.
   ok(logBtn.n.getAttribute('aria-label') !== padBtn.n.getAttribute('aria-label'),
     'and they are two different controls, not one button wired to both');
+}
+
+// ===========================================================================
+section('UI: the way out of a table, and the way back to one');
+// ===========================================================================
+
+// THE BUG THIS EXISTS FOR. Once a match started there was no way to leave it.
+// The lobby had no exit either. Closing the tab was the only way out, and
+// opening the app again put you straight back in your seat — so a player who
+// wanted to go could not, and the table they wanted to leave could not tell
+// they had tried.
+//
+// Stated over every frame the renderer can produce for a table, for the reason
+// the rules-route section gives: an assertion naming the play screen fixes the
+// play screen and lets the next screen rot. Found BY PRESSING, as everywhere
+// else in this file — a control that renders and does nothing is not an exit.
+{
+  // Press everything; say what each control fired.
+  const pressAll = (app) => {
+    const r = draw(app);
+    const hits = [];
+    for (const n of interactive(r.root)) {
+      const before = r.calls.length;
+      n.click();
+      hits.push({ n, fired: r.calls.slice(before).map((c) => c.name) });
+    }
+    return hits;
+  };
+  const firing = (hits, name) => hits.filter((h) => h.fired.includes(name));
+  const sheetText = (app) => {
+    const r = draw(app);
+    return byClass(r.root, 'leave-sheet').map((n) => n.text).join(' ');
+  };
+
+  let frames = 0, noExit = 0, oneTap = 0, gated = 0, noisy = 0, unnamed = 0;
+  let sheets = 0, noConfirm = 0, manyConfirms = 0, noStay = 0, confirmNoisy = 0, confirmGated = 0;
+  const firstStuck = [];
+  const phasesSeen = new Set();
+
+  const check = (pub, priv, isHost, where) => {
+    frames++;
+    phasesSeen.add(pub.phase);
+    const over = pub.phase === PHASES.MATCH_OVER;
+
+    // `busy` is in here because it greys the play button and the bid button
+    // while an intent is in flight, and a leave control that greyed out with
+    // them would trap a player behind a host that has stopped answering —
+    // which is the single likeliest moment for somebody to want out.
+    for (const busy of [false, true]) {
+      const shut = pressAll(baseApp({ pub, priv, isHost, busy, showLeave: false }));
+      const openers = firing(shut, 'toggleLeave');
+      const direct = firing(shut, 'leaveGame');
+
+      // A WAY OUT, ALWAYS. Through the sheet while there is something to
+      // lose; straight out once the match is over and there is not.
+      if (openers.length + direct.length === 0) {
+        noExit++;
+        if (firstStuck.length < 4) firstStuck.push(where);
+        continue;
+      }
+      // AND NEVER ONE TAP FROM THE TABLE WHILE A MATCH IS ON. The opener sits
+      // beside PAD and LOG and will be pressed by accident; an accident has
+      // to cost a second, deliberate tap rather than a seat.
+      if (!over && direct.length) oneTap++;
+
+      for (const { n, fired } of [...openers, ...direct]) {
+        if (fired.length !== 1) noisy++;
+        if (n.disabled) gated++;
+        if (!/[\p{L}\p{N}]/u.test(n.getAttribute('aria-label') || n.text.trim())) unnamed++;
+      }
+
+      // THE SHEET ITSELF. Exactly one control in it leaves, it does that and
+      // nothing else, and something else in it says no.
+      const open = pressAll(baseApp({ pub, priv, isHost, busy, showLeave: true }));
+      sheets += byClass(uiRoot, 'leave-sheet').length;
+      const inSheet = (h) => {
+        for (let p = h.n; p; p = p.parent) if (p.hasClass && p.hasClass('leave-sheet')) return true;
+        return false;
+      };
+      const confirms = firing(open, 'leaveGame').filter(inSheet);
+      if (confirms.length === 0) noConfirm++;
+      if (confirms.length > 1) manyConfirms++;
+      for (const { n, fired } of confirms) {
+        if (fired.length !== 1) confirmNoisy++;
+        if (n.disabled) confirmGated++;
+      }
+      if (firing(open, 'toggleLeave').filter(inSheet).length === 0) noStay++;
+    }
+  };
+
+  sweepLobby((g, pub, priv, id) => {
+    check(pub, priv, id === 'p0', `lobby seats=${pub.seats.length} as ${id}`);
+  });
+  for (const config of UI_CONFIGS) {
+    sweepMatch(config, 4, (g, pub, priv, id) => {
+      check(pub, priv, id === 'p0', `${config.scoring}/${pub.phase} as ${id}`);
+    });
+  }
+
+  ok(frames > 400, `${frames} table frames checked, from the owner's chair, a player's and a stranger's`);
+  for (const phase of Object.values(PHASES)) {
+    ok(phasesSeen.has(phase), `including ${phase}`);
+  }
+  eq(noExit, 0, `every one of them has a way to leave${
+    firstStuck.length ? ` (stuck: ${firstStuck.join('; ')})` : ''}`);
+  eq(oneTap, 0, 'and while a match is on, never one that leaves on the first tap');
+  eq(gated, 0, 'no way out is ever disabled — not for a guest, not mid-intent');
+  eq(noisy, 0, 'each one does a single thing when pressed');
+  eq(unnamed, 0, 'and each carries a name a voice can read, including the ✕ in the strip');
+  ok(sheets >= frames * 2, `${sheets} leave sheets were drawn, so the checks on it are not vacuous`);
+  eq(noConfirm, 0, 'every sheet has a control that actually leaves');
+  eq(manyConfirms, 0, 'and exactly one, so there is one thing to be sure about');
+  eq(confirmNoisy, 0, 'which does that and nothing else');
+  eq(confirmGated, 0, 'and is never disabled');
+  eq(noStay, 0, 'and every sheet has a way to say no from inside it');
+
+  // The shim has to know what a parent is for the scoping above to mean
+  // anything. If it did not, inSheet() would be false for everything and
+  // noConfirm would have counted every frame — but a check that fails loudly
+  // for the wrong reason is still a check nobody can read, so say it here.
+  ok(sheets > 0 && noConfirm === 0, 'the sheet scoping found its own buttons');
+
+  // --- THE SHEET ONLY EVER SITS OVER A TABLE --------------------------------
+  // showLeave is view state in `app`, so it can outlive the screen that set
+  // it. Left on over the home screen it would ask "leave the game?" of
+  // somebody who already has.
+  for (const screen of SCREENS.filter((s) => s !== 'game')) {
+    const hits = pressAll(baseApp({ screen, pub: null, priv: null, showLeave: true }));
+    eq(firing(hits, 'leaveGame').length, 0, `screen '${screen}' with showLeave set draws no leave sheet`);
+  }
+  eq(byClass(draw(baseApp({ screen: 'game', pub: null, priv: null, showLeave: true })).root, 'leave-sheet').length, 0,
+    'nor does a game screen that has no table yet');
+
+  // --- WHAT THE SHEET SAYS, WHICH IS THE REASON IT EXISTS --------------------
+  //
+  // The sentence is a promise about what js/main.js's leaveGame() will do, and
+  // there are five different promises. Each is checked for the claim that
+  // would be FALSE if it were shown to the wrong person, because the failure
+  // here is not an ugly screen: it is a host told their seat is kept who then
+  // stops six people's game, or a guest in a lobby told their seat is kept
+  // when the engine is about to splice it out.
+  const midMatch = playMatchUntil({ config: UI_CONFIGS[0], players: 4 },
+    (e) => e.phase === PHASES.PLAY && e.plays.length > 0);
+  const mpub = midMatch.publicState();
+  const lobbyEngine = new GameEngine();
+  seatTable(lobbyEngine, ['Ana', 'Ben', 'Cleo']);
+  const lpub = lobbyEngine.publicState();
+  const say = (pub, priv, isHost) => sheetText(baseApp({ pub, priv, isHost, code: 'QRTX', showLeave: true }));
+
+  const hostMid = say(mpub, midMatch.privateStateFor('p0'), true);
+  ok(/stops for everyone/i.test(hostMid), 'a host mid-match is told the game stops for everyone');
+  ok(/RESUME/.test(hostMid), 'and that RESUME brings it back');
+  ok(hostMid.includes('QRTX'), 'and which room the others rejoin');
+  ok(!/seat is kept|bot plays/i.test(hostMid), 'and is NOT told a bot will cover for them — nothing runs while the host is away');
+
+  const guestMid = say(mpub, midMatch.privateStateFor('p1'), false);
+  ok(/seat is kept/i.test(guestMid), 'a player mid-match is told their seat is kept');
+  ok(/bot/i.test(guestMid), 'and that a bot plays their cards meanwhile');
+  ok(guestMid.includes('QRTX'), 'and which room to rejoin');
+  ok(/this device/i.test(guestMid), 'and that it is THIS device that gets the seat back — it is the ticket, not the name');
+  ok(!/stops for everyone|RESUME/.test(guestMid), 'and is not told the game stops, because it does not');
+
+  const hostLobby = say(lpub, lobbyEngine.privateStateFor('p0'), true);
+  ok(/closes the table/i.test(hostLobby), 'a host in the lobby is told the table closes');
+  ok(!/RESUME|kept/i.test(hostLobby), 'and is promised no way back, because none is kept');
+
+  const guestLobby = say(lpub, lobbyEngine.privateStateFor('p1'), false);
+  ok(/given up/i.test(guestLobby), 'a guest in the lobby is told the seat is given up');
+  ok(!/seat is kept|bot/i.test(guestLobby), 'and NOT that it is kept — the engine removes a lobby seat outright');
+
+  const stranger = say(mpub, null, false);
+  ok(/do not have a seat/i.test(stranger), 'a device with no seat is told it has none');
+  ok(!/kept|bot|RESUME/i.test(stranger), 'and is promised nothing');
+
+  // isHost DECIDES IT AND isOwner DOES NOT — the one place in the file where
+  // the device is the right thing to ask, because the question is whose phone
+  // the game stops with. An owner who is not hosting leaves like anybody else;
+  // a host who is not the owner still takes the engine with them.
+  const p1 = midMatch.privateStateFor('p1');
+  eq(say(mpub, { ...p1, isOwner: true }, false), guestMid,
+    'an owner who is not the host reads exactly what any other player reads');
+  eq(say(mpub, { ...midMatch.privateStateFor('p0'), isOwner: false }, true), hostMid,
+    'and a host who is not the owner still reads the host\'s sentence');
+
+  // --- THE WAY BACK, ON THE HOME SCREEN --------------------------------------
+  const home = (over) => pressAll(baseApp({ screen: 'home', pub: null, priv: null, isHost: false, ...over }));
+  const homeText = (over) => walk(draw(baseApp({ screen: 'home', pub: null, priv: null, isHost: false, ...over })).root)
+    .map((n) => (typeof n.text === 'string' ? n.text : '')).join(' ');
+
+  const plain = home({});
+  eq(firing(plain, 'resumeTable').length + firing(plain, 'forgetTable').length, 0,
+    'with no table left behind, the home screen offers no way back to one');
+
+  for (const role of ['host', 'client']) {
+    const hits = home({ left: { role, code: 'QRTX' } });
+    eq(firing(hits, 'resumeTable').length, 1, `a ${role} who left is offered exactly one way back`);
+    eq(firing(hits, 'forgetTable').length, 1, 'and exactly one way to throw the offer away');
+    eq(firing(hits, 'resumeTable')[0].fired.length, 1, 'going back does one thing');
+    ok(homeText({ left: { role, code: 'QRTX' } }).includes('QRTX'), 'and the card names the room');
+    // THE NEW-GAME BUTTONS ARE STILL THERE. The card is an offer, not a wall.
+    eq(firing(hits, 'host').length + firing(hits, 'goJoin').length, 2,
+      'while hosting and joining something else stay available underneath it');
+
+    // NOT GATED ON A NAME. HOST and JOIN are disabled until one is typed, and
+    // the card must not be: a resumed host is seated from the snapshot and a
+    // returning player is found by ticket. A card that needed a name would be
+    // a RESUME button that does nothing on a device that had cleared the field.
+    const blank = home({ left: { role, code: 'QRTX' }, me: { name: '' } });
+    eq(firing(blank, 'resumeTable').length, 1, `and a ${role} with no name typed can still go back`);
+    eq(firing(blank, 'host').length, 0, 'though hosting something new still wants one');
+  }
+
+  // The two roles are told different things, because they are different
+  // promises: one is the game itself, the other is a seat somebody else holds.
+  const hostCard = homeText({ left: { role: 'host', code: 'QRTX' } });
+  const guestCard = homeText({ left: { role: 'client', code: 'QRTX' } });
+  ok(/RESUME/.test(hostCard) && !/RESUME/.test(guestCard), 'a host is offered RESUME, a player is not');
+  ok(/REJOIN/.test(guestCard) && !/REJOIN/.test(hostCard), 'a player is offered REJOIN, a host is not');
+  ok(/ends the game for everyone/i.test(hostCard),
+    'and the host is told what discarding costs BEFORE pressing it, since nothing asks afterwards');
+  ok(/while the game is on/i.test(guestCard),
+    'while the player is promised the seat only for as long as there is a game to hold it in');
+
+  // AND ONLY ON THE HOME SCREEN. `left` stays in app while the player is on
+  // the join screen or an error screen, and a RESUME button on the screen
+  // that says a dial just failed is a second dial with no explanation.
+  for (const screen of SCREENS.filter((s) => s !== 'home' && s !== 'nonsense')) {
+    const hits = pressAll(baseApp({ screen, pub: null, priv: null, left: { role: 'host', code: 'QRTX' } }));
+    eq(firing(hits, 'resumeTable').length, 0, `screen '${screen}' does not draw the way-back card`);
+  }
 }
 
 console.log(`\n(the renderer sweep drew ${uiFrames} frames)`);
@@ -7676,6 +8147,67 @@ section('The wire: three frame types, each written and read by one pair');
   eq(readJoinFrame(replacedFrame()), null, 'nor the hello reader');
 }
 
+{
+  // THE TWO GOODBYES. One each way, and both built on REPLACED's pattern: a
+  // fact the other end cannot observe for itself, with nothing in it.
+  //
+  // SWEPT AS A FAMILY rather than written out twice, because the property that
+  // matters most is a property BETWEEN them: every last-words frame must be
+  // read by its own predicate and by no other. A LEAVE read as HOSTLEFT throws
+  // a whole table off a game that one person walked away from; a HOSTLEFT read
+  // as REPLACED tells every player their seat is open in another tab. Listing
+  // them in one table means a fourth one is checked against the other three
+  // the moment it is added, instead of against whichever the author thought of.
+  const LAST_WORDS = [
+    { name: 'replaced', build: replacedFrame, is: isReplacedFrame, type: WIRE.REPLACED },
+    { name: 'leave', build: leaveFrame, is: isLeaveFrame, type: WIRE.LEAVE },
+    { name: 'hostleft', build: hostLeftFrame, is: isHostLeftFrame, type: WIRE.HOSTLEFT },
+  ];
+  const JUNK = [null, undefined, '', 0, false, [], {}, 'leave', 'hostleft',
+    { type: WIRE.STATE }, { type: WIRE.JOIN }, { type: WIRE.WATCH }, { type: WIRE.REJECTED },
+    { type: 'playCard' }, { type: 'placeBid' }, { leave: true }, { type: null }, { type: ['leave'] }];
+
+  for (const f of LAST_WORDS) {
+    ok(f.is(f.build()), `the ${f.name} pair round-trips`);
+    eq(f.build().type, f.type, `as WIRE.${f.name.toUpperCase()}`);
+    eq(Object.keys(f.build()).length, 1, `${f.name}: a type and nothing else — no seat, no ticket, no field to forge`);
+    ok(f.is(JSON.parse(JSON.stringify(f.build()))), `${f.name}: it survives the wire`);
+    ok(f.build() !== f.build(), `${f.name}: a fresh object each time, so no caller can alter another's frame`);
+
+    let wrongly = 0;
+    for (const junk of JUNK) {
+      let out;
+      try { out = f.is(junk); } catch (_) { wrongly++; continue; }
+      if (out !== false) wrongly++;
+    }
+    eq(wrongly, 0, `${f.name}: none of ${JUNK.length} other values is read as one, and none throws`);
+
+    // The cross product, which is the point of the table.
+    for (const other of LAST_WORDS) {
+      if (other === f) continue;
+      eq(other.is(f.build()), false, `a ${f.name} frame is not read as ${other.name}`);
+    }
+
+    // And the three readers that carry a payload must not claim an empty one.
+    eq(readRejectFrame(f.build()), null, `${f.name}: the refusal reader does not claim it`);
+    eq(readStateFrame(f.build()), null, `${f.name}: nor the state reader`);
+    eq(readJoinFrame(f.build()), null, `${f.name}: nor the hello reader`);
+    eq(isWatchFrame(f.build()), false, `${f.name}: nor the watcher's hello`);
+
+    // NOT A GAME INTENT, checked by handing it to the dispatcher. If one of
+    // these ever became a case in intents.js it would be a move a peer could
+    // make ON THE ENGINE — and `leave` is exactly the word somebody would
+    // reach for. The transport consumes these before onData; this is what
+    // holds if it ever stops doing so.
+    const g = new GameEngine();
+    seatTable(g, ['Ana', 'Ben', 'Cleo']);
+    const snap = JSON.stringify(g.serialize());
+    const out = applyGameIntent(g, 'p1', f.build(), 0);
+    eq(out.handled, false, `${f.name}: the game dispatcher does not recognise it`);
+    eq(JSON.stringify(g.serialize()), snap, `${f.name}: and the engine is untouched by it`);
+  }
+}
+
 // ===========================================================================
 section('Storage: one prefix, one ticket, and the key that is never cleared');
 // ===========================================================================
@@ -7935,6 +8467,100 @@ const ENGINE_KEY = 'judgement.engine';
   storage.restore();
 }
 
+{
+  // --- the table this device walked away from ------------------------------
+  //
+  // ONE FLAG SEPARATES "put me back at the table when I reload" FROM "show me
+  // a button", and leftTable() is the one function that reads it. Boot calls
+  // it to decide whether to offer rather than resume, goHome() calls it to
+  // decide whether there is a record worth keeping, and the home screen's card
+  // is drawn from its answer — so a wrong answer here is either a player
+  // dragged back into a game they left, or a host's only copy of a match
+  // cleared on the way to the home screen.
+  const storage = installStorage();
+  const snap = { v: 1, phase: 'play' };
+
+  eq(leftTable(), null, 'with nothing stored there is no table to go back to');
+
+  // A LIVE session is not a left one. This is the case that must keep
+  // resuming on its own, so it must NOT show up as an offer.
+  saveSession({ role: 'client', code: 'QRTX', name: 'Ana' });
+  eq(leftTable(), null, 'a live client session is not a table that was left');
+  saveSession({ role: 'host', code: 'QRTX', name: 'Ana' });
+  saveEngineSnapshot(snap);
+  eq(leftTable(), null, 'nor is a live host session, snapshot and all');
+
+  // The two parked shapes.
+  saveSession({ role: 'client', code: 'QRTX', name: 'Ana', left: true });
+  same(leftTable(), { role: 'client', code: 'QRTX' }, 'a client that left is offered its room back');
+  saveSession({ role: 'host', code: 'QRTX', name: 'Ana', left: true });
+  same(leftTable(), { role: 'host', code: 'QRTX' }, 'and a host that left is offered its game back');
+
+  // WHAT COMES BACK IS A ROLE AND A CODE AND NOTHING ELSE. The name stays in
+  // storage: the card does not show it, and an object that carried it would
+  // be one refactor from rendering a stored string nobody validated.
+  same(Object.keys(leftTable()).sort(), ['code', 'role'], 'the answer carries a role and a code, and no more');
+
+  // A PARKED HOST WITHOUT ITS SNAPSHOT IS NOT AN OFFER. The record says where
+  // the game was; the snapshot is the game. Resuming without one opens an
+  // empty lobby on a code six people are about to redial.
+  storage.store.raw.delete(ENGINE_KEY);
+  eq(leftTable(), null, 'a parked host with no snapshot behind it is not offered');
+  saveSession({ role: 'client', code: 'QRTX', name: 'Ana', left: true });
+  same(leftTable(), { role: 'client', code: 'QRTX' },
+    'a client needs none — the game it is going back to is on somebody else\'s device');
+
+  // `left` IS READ STRICTLY. Anything that is not exactly true is a live
+  // session, because the safe failure is the old behaviour.
+  for (const junk of [false, 'true', 1, 'yes', null, {}, []]) {
+    saveSession({ role: 'client', code: 'QRTX', name: 'Ana', left: junk });
+    eq(leftTable(), null, `left: ${JSON.stringify(junk)} is not a parked table`);
+  }
+
+  // READ BACK OFF DISK, SO NOTHING IN IT IS TRUSTED. A code that does not
+  // normalise to a code is no table — never a table to dial — and a role that
+  // is not one of the two is not quietly treated as the other one.
+  for (const code of ['', 'QR', 'O0I1', null, undefined, 42, {}, ['QRTX']]) {
+    saveSession({ role: 'client', code, name: 'Ana', left: true });
+    eq(leftTable(), null, `a stored code of ${JSON.stringify(code)} is not offered`);
+  }
+  saveSession({ role: 'client', code: 'qr-tx', name: 'Ana', left: true });
+  same(leftTable(), { role: 'client', code: 'QRTX' }, 'a code that normalises to one is handed back normalised');
+  for (const role of ['', 'owner', 'watcher', 'HOST', null, undefined, 1]) {
+    saveSession({ role, code: 'QRTX', name: 'Ana', left: true });
+    saveEngineSnapshot(snap);
+    eq(leftTable(), null, `a stored role of ${JSON.stringify(role)} is not offered`);
+  }
+
+  // IT EXPIRES WITH THE SESSION, on the same clock, because it IS the session.
+  // An offer that outlived the TTL would be a RESUME button over a snapshot
+  // loadEngineSnapshot() has already stopped returning.
+  const EIGHT_HOURS = 8 * 60 * 60 * 1000;
+  saveSession({ role: 'host', code: 'QRTX', name: 'Ana', left: true });
+  saveEngineSnapshot(snap);
+  storeClock.advance(EIGHT_HOURS - 1000);
+  same(leftTable(), { role: 'host', code: 'QRTX' }, 'a parked game is still on offer just inside eight hours');
+  storeClock.advance(2000);
+  eq(leftTable(), null, 'and is gone just past them');
+  eq(storage.store.raw.has(SESSION_KEY), false, 'along with the record, so the card cannot come back on the next paint');
+
+  // And it never throws, for the reason nothing else in this file may: it
+  // runs in the first lines of boot.
+  let threw = 0;
+  for (const raw of ['{', 'null', '[]', '"x"', '{"left":true}', '{"left":true,"ts":"soon"}']) {
+    storage.store.raw.set(SESSION_KEY, raw);
+    try { if (leftTable() !== null) threw++; } catch (_) { threw++; }
+  }
+  eq(threw, 0, 'a corrupt record is no table, and reading it does not throw');
+  storage.restore();
+
+  const broken = installStorage({ broken: true });
+  let out = 'unset';
+  try { out = leftTable(); } catch (_) { out = 'threw'; }
+  eq(out, null, 'and with no storage at all there is simply nothing to go back to');
+  broken.restore();
+}
+
 storeClock.restore();
 
 // ===========================================================================
@@ -7957,7 +8583,7 @@ function liveTable(clock, { code = 'QRTX', hostName = 'Ana', hostTicket = 'host-
   engine.addPlayer(HOST_ID, hostName, { clientId: hostTicket, isOwner: true });
 
   const seen = {
-    open: null, connects: [], joins: [], data: [], drops: [], errors: [],
+    open: null, connects: [], joins: [], data: [], drops: [], leaves: [], errors: [],
     // WHEN each error arrived, not just that it did. The retry ladder's whole
     // promise is a shape in time — doubling from a second, capped at eight —
     // and a test that only counts errors agrees with a ladder that fired all
@@ -8022,6 +8648,10 @@ function liveTable(clock, { code = 'QRTX', hostName = 'Ana', hostTicket = 'host-
       push();
     },
     onDisconnect: (pid) => { seen.drops.push(pid); engine.disconnect(pid); push(); },
+    // As main.js wires it: the same seat going, with the one flag that says it
+    // went on purpose. Recorded separately from `drops` because the claim the
+    // transport makes is that a connection produces exactly one of the two.
+    onLeave: (pid) => { seen.leaves.push(pid); engine.disconnect(pid, { left: true }); push(); },
     onError: (e) => { seen.errors.push(e); seen.errorAt.push(clock.elapsed()); },
     onBrokerDown: () => { seen.brokerDown++; },
     onBrokerUp: () => { seen.brokerUp++; },
@@ -8030,10 +8660,11 @@ function liveTable(clock, { code = 'QRTX', hostName = 'Ana', hostTicket = 'host-
   clock.advance(10);
 
   const join = (name, ticket, { dialCode = code, identity = undefined } = {}) => {
-    const box = { name, ticket, states: [], rejects: [], data: [], closes: 0, errors: [], opens: 0 };
+    const box = { name, ticket, states: [], rejects: [], data: [], closes: 0, errors: [], opens: 0, hostLeft: 0 };
     box.net = joinHost(dialCode, {
       onOpen: () => { box.opens++; },
       onState: (pub, priv) => box.states.push({ pub, priv }),
+      onHostLeft: () => { box.hostLeft++; },
       onData: (msg) => {
         const r = readRejectFrame(msg);
         if (r) box.rejects.push(r); else box.data.push(msg);
@@ -9896,6 +10527,208 @@ function playUpToRound(clock, table, rounds) {
 }
 
 // ===========================================================================
+section('The transport: leaving on purpose, and the host putting the table down');
+// ===========================================================================
+
+// THE SECTION ABOVE IS ABOUT ACCIDENTS. This one is about the same two events
+// — a seat going away, a host going away — done deliberately, and the claim is
+// narrow: a goodbye changes HOW the other end hears it and changes nothing
+// about what is kept. So each case is run next to the accident it replaces.
+{
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+
+  const TICKET = 'ticket-dev-004';
+  table.join('Ben', 'ticket-ben-001');
+  const cleo = table.join('Cleo', 'ticket-cleo-002');
+  const dev = table.join('Dev', TICKET);
+  clock.advance(20);
+  table.engine.setConfig(HOST_ID, { maxHand: 3, shape: 'descending', trumpMethod: 'turnup', scoring: 'kachuful' });
+  ok(table.engine.startMatch(HOST_ID, clock.elapsed()).ok, 'four at a table, and a match on');
+  table.push();
+  clock.advance(10);
+  playUpToRound(clock, table, 1);
+
+  const devSeat = dev.seat();
+  const devId = playerIdForConn(dev.net.peer.id);
+  ok(devSeat >= 0 && table.engine.history.length >= 1, `Dev is in seat ${devSeat} with a round on the scoreboard`);
+  const kept = JSON.parse(JSON.stringify({
+    hand: table.engine.hands[devSeat], totals: table.engine.totals,
+    history: table.engine.history, name: table.engine.seats[devSeat].name,
+  }));
+
+  // --- a player says goodbye ------------------------------------------------
+  const dropsBefore = table.seen.drops.length;
+  const framesBefore = cleo.states.length;
+  dev.net.send(leaveFrame());
+  clock.advance(50);
+
+  same(table.seen.leaves, [devId], 'the host is told the seat LEFT, once, by the id of the connection that said so');
+  eq(table.seen.drops.length, dropsBefore,
+    'and is NOT also told it disconnected — the close behind the goodbye is swallowed, not reported twice');
+  eq(table.engine.seats.length, 4, 'the chair is still there');
+  eq(table.engine.seats[devSeat].connected, false, 'marked away');
+  eq(table.engine.seats[devSeat].left, true, 'and marked as having gone on purpose, which is what paces the bot');
+  same(table.engine.hands[devSeat], kept.hand, 'still holding its cards');
+  eq(table.engine.log[table.engine.log.length - 1].text, `${kept.name} left`, 'the table is told so in words');
+  ok(cleo.states.length > framesBefore, 'and told at once, by a push to everybody who stayed');
+  eq(cleo.last().pub.seats[devSeat].connected, false, 'who see the seat as away');
+
+  // The host hangs up on a connection that has said goodbye, rather than
+  // waiting for a device that is on its way out to get round to it.
+  ok(!table.host.playerIds().includes(devId), 'the host no longer holds the connection');
+  eq(dev.closes, 1, 'and closed it from its own end');
+  eq(dev.hostLeft, 0, 'without mistaking any of that for the host leaving');
+
+  // NOTHING THE GONE CONNECTION SAYS NOW COUNTS. It cannot play the hand it
+  // left, and it cannot un-leave by simply carrying on.
+  const playsBefore = JSON.stringify(table.engine.serialize());
+  dev.net.send({ type: 'placeBid', bid: 0 });
+  dev.net.send({ type: 'playCard', code: kept.hand[0] });
+  clock.advance(20);
+  eq(JSON.stringify(table.engine.serialize()), playsBefore, 'a connection that left cannot move the seat it left');
+
+  // --- and comes back --------------------------------------------------------
+  // A new peer, a new connection, the same ticket: exactly what the device
+  // that dies does, because to the host they are the same thing.
+  const again = table.join('Dev', TICKET);
+  clock.advance(50);
+  eq(table.engine.seats.length, 4, 'no fifth seat was invented');
+  eq(again.seat(), devSeat, 'the same chair came back');
+  eq(table.engine.seats[devSeat].connected, true, 'present again');
+  eq(table.engine.seats[devSeat].left, false, 'and no longer marked as gone');
+  same(again.last().priv.hand.map((c) => c.code), sortHand(kept.hand, table.engine.trump),
+    'holding the hand it left with, card for card');
+  same(again.last().pub.history, kept.history, 'and the whole scoreboard');
+  same(again.last().pub.seats.map((s) => s.total), kept.totals, 'with every running total intact');
+  eq(table.seen.leaves.length, 1, 'coming back is not reported as another leave');
+
+  // --- a late goodbye from a connection that has been superseded -------------
+  //
+  // Two tabs of one browser share a ticket. The second takes the seat; the
+  // first is still open and — in this rig, which does not retire it — still in
+  // the host's map. If that first tab now presses LEAVE, the seat it is
+  // "leaving" is one it no longer holds, and the tab that DOES hold it must
+  // not be thrown out of its chair by somebody else's goodbye.
+  const second = table.join('Dev', TICKET);
+  clock.advance(50);
+  const secondId = playerIdForConn(second.net.peer.id);
+  eq(table.engine.seats[devSeat].id, secondId, 'a second connection on the same ticket now holds the seat');
+  again.net.send(leaveFrame());
+  clock.advance(50);
+  eq(table.engine.seats[devSeat].connected, true, 'the superseded connection saying goodbye does not vacate it');
+  eq(table.engine.seats[devSeat].left, false, 'nor mark it as left');
+  eq(table.engine.seats[devSeat].id, secondId, 'and it still answers to the connection that holds it');
+  eq(second.closes, 0, 'which is untouched');
+  eq(again.closes, 1, 'while the one that said goodbye was hung up on, as it asked');
+
+  // --- a goodbye from somebody who never sat down ----------------------------
+  // A connection with no seat can say it too. It vacates nothing, because it
+  // holds nothing, and the host must not fall over being told.
+  const stranger = table.join('Late', 'ticket-late-009');
+  clock.advance(50);
+  eq(stranger.seat(), -1, 'a device that arrives mid-match gets no seat');
+  const before = JSON.stringify(table.engine.serialize());
+  stranger.net.send(leaveFrame());
+  clock.advance(50);
+  eq(JSON.stringify(table.engine.serialize()), before, 'and its goodbye changes nothing at the table');
+  eq(stranger.closes, 1, 'though it is still hung up on, so it does not sit holding a connection');
+
+  // --- THE HOST says goodbye ---------------------------------------------------
+  //
+  // To everybody at once, players and the seatless alike, and then goes. The
+  // frame is what lets a client tell this from a host whose phone died: both
+  // are followed by the same close.
+  const watcher = table.join(null, null, { identity: WATCHER });
+  clock.advance(50);
+  const present = [cleo, second, watcher];
+  for (const c of present) { c.hostLeftBefore = c.hostLeft; c.dataBefore = c.data.length; c.closesBefore = c.closes; }
+  table.host.broadcast(hostLeftFrame());
+  clock.advance(20);
+  for (const c of present) {
+    eq(c.hostLeft - c.hostLeftBefore, 1, `${c.name || 'the watcher'} is told the host left, exactly once`);
+    eq(c.data.length, c.dataBefore,
+      'through its own handler and not through onData — where it would be read as a refusal, or as nothing');
+    eq(c.closes, c.closesBefore, 'and BEFORE the channel closes, which is the only order in which it is any use');
+  }
+  eq(dev.hostLeft + again.hostLeft + stranger.hostLeft, 0,
+    'the connections that had already gone are not told anything at all');
+
+  table.host.destroy();
+  clock.advance(100);
+  for (const c of present) eq(c.closes - c.closesBefore, 1, `and then ${c.name || 'the watcher'}'s channel closes behind it`);
+
+  for (const c of table.clients) c.net.destroy();
+  clock.advance(100);
+  net.uninstall();
+}
+
+{
+  // --- the lobby, where a goodbye and a drop are the same thing --------------
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  const ben = table.join('Ben', 'ticket-ben-001');
+  table.join('Cleo', 'ticket-cleo-002');
+  clock.advance(20);
+  eq(table.engine.seats.length, 3, 'three in a lobby');
+
+  ben.net.send(leaveFrame());
+  clock.advance(50);
+  eq(table.engine.seats.length, 2, 'leaving a lobby vacates the chair, as dropping out of one does');
+  eq(table.seen.leaves.length, 1, 'reported as a leave');
+  eq(table.seen.drops.length, 0, 'and not as a drop as well');
+  eq(table.engine.startBlocker(), 'needs 3 players, has 2', 'so the lobby is not left waiting on a ghost');
+
+  // And the same ticket walking back in is simply a new arrival.
+  const back = table.join('Ben', 'ticket-ben-001');
+  clock.advance(50);
+  eq(table.engine.seats.length, 3, 'the same device joins again');
+  ok(back.seat() >= 0, 'and is seated');
+
+  table.teardown();
+  net.uninstall();
+}
+
+{
+  // --- a watcher's goodbye gives its slot back, once ---------------------------
+  //
+  // The watcher cap is a count, and the LEAVE branch closes the connection
+  // itself — so it runs the same teardown a close does. If it ran it twice the
+  // count would go below what is really connected and the ceiling would
+  // quietly lift; if it ran it not at all, eight televisions that said goodbye
+  // would lock the ninth out for the rest of the match.
+  const net = installPeerJS();
+  broker = net.broker;
+  const { clock } = net;
+  const table = liveTable(clock, { code: 'QRTX' });
+  const tvs = [];
+  for (let i = 0; i < MAX_WATCHERS; i++) tvs.push(table.join(null, null, { identity: WATCHER }));
+  clock.advance(50);
+  eq(table.seen.watches.filter(([, okd]) => okd).length, MAX_WATCHERS, `${MAX_WATCHERS} watchers fill the room`);
+  const refused = table.join(null, null, { identity: WATCHER });
+  clock.advance(50);
+  eq(table.seen.watches.filter(([, okd]) => !okd).length, 1, 'and the next one is turned away');
+
+  tvs[0].net.send(leaveFrame());
+  clock.advance(50);
+  eq(tvs[0].closes, 1, 'one of them says goodbye and is hung up on');
+  const one = table.join(null, null, { identity: WATCHER });
+  const two = table.join(null, null, { identity: WATCHER });
+  clock.advance(50);
+  const accepted = table.seen.watches.filter(([, okd]) => okd).length;
+  eq(accepted, MAX_WATCHERS + 1, 'which frees exactly one slot — the next watcher is let in');
+  eq(table.seen.watches.filter(([, okd]) => !okd).length, 2, 'and the one after that is turned away again');
+  ok(one && two && refused, 'with all three late arrivals accounted for');
+
+  table.teardown();
+  net.uninstall();
+}
+
+// ===========================================================================
 section('The transport: the broker falls over and the game does not');
 // ===========================================================================
 
@@ -11342,6 +12175,31 @@ section('The rules sheet says what the code actually does');
     'and states it as a setting rather than a law, because it is a lobby toggle');
   ok(new RegExp(`on by default`, 'i').test(hookText) === (DEFAULT_CONFIG.hook === true),
     `and names the real default (DEFAULT_CONFIG.hook is ${DEFAULT_CONFIG.hook})`);
+
+  // --- leaving, which the sheet used to get wrong in the other direction ---
+  //
+  // It said the host's device "must stay: if it leaves, the match ends". That
+  // was true when it was written and became false the day a host could park a
+  // game and resume it — and a sheet that tells the host their match is over
+  // is a sheet that gets a resumable game abandoned. The wording is free; the
+  // three facts are not, and each is pinned to the thing that makes it true.
+  const together = (dialog.match(/<h3>Playing together<\/h3>[\s\S]*$/) || [''])[0].replace(/<[^>]*>/g, '');
+  ok(together.length > 200, 'the sheet has a section on playing together');
+  ok(!/match ends|must stay/i.test(together), 'which no longer says the match ends when the host leaves');
+  ok(/RESUME/.test(together), 'and names the button that brings a host\'s game back');
+  ok(/same code/i.test(together) && /same device/i.test(together),
+    'and says a seat comes back by code AND device — it is the ticket that reclaims it, never the name');
+  // The driver is what makes "a bot plays your cards" true, so ask it.
+  {
+    const g = playMatchUntil({ config: UI_CONFIGS[0], players: 3 }, (e) => e.phase === PHASES.BIDDING);
+    const onMove = g.seats[g.turnSeat];
+    g.disconnect(onMove.id, { left: true });
+    const d = createBotDriver();
+    d.tick(g, 0);
+    const covered = d.tick(g, BOT_THINK_MS);
+    eq(/bot plays your cards/i.test(together), covered,
+      'and its claim that a bot plays for a player who left is what the driver actually does');
+  }
 }
 
 // ===========================================================================
@@ -11511,6 +12369,11 @@ section('The seams: two files, one string, and nothing enforcing it');
     {}, { showPad: true }, { showLog: true }, { error: 'Nope.' }, { busy: true },
     { reconnecting: true }, { netWarning: 'Slow.' }, { isHost: false },
     { selected: 'AS' }, { selectedBid: 1 }, { announce: 'hi' },
+    // The leave sheet over a table, and the way-back card on the home screen,
+    // in both of the roles it is drawn for. .leave-sheet renders in no frame
+    // without the first of these, and read as a dead rule until it was added.
+    { showLeave: true }, { showLeave: true, isHost: false },
+    { left: { role: 'host', code: 'WXYZ' } }, { left: { role: 'client', code: 'WXYZ' } },
   ];
   const everyWay = (over) => { for (const f of FLAGS) grab(baseApp({ ...over, ...f })); };
 
@@ -11985,6 +12848,175 @@ section('The seams: two files, one string, and nothing enforcing it');
     ok(bail !== -1, 'the host returns early on a frame the dispatcher did not recognise');
     ok(bail !== -1 && pushes !== -1 && bail < pushes,
       'and returns BEFORE push(), so junk cannot fan one frame out to the whole table');
+
+    // --- seam 6: leaving, parking, and coming back -------------------------
+    //
+    // SOURCE-LEVEL FOR THE SAME REASON AS EVERYTHING ELSE IN THIS BLOCK, and
+    // with more at stake than most of it. Every other part of this feature is
+    // exercised for real above: the engine keeps the seat, the driver paces
+    // it, the transport delivers the goodbye, leftTable() reads the record,
+    // the renderer offers the buttons. What is left is the ORDER in which
+    // main.js does five things, and each of the orders below is one that
+    // reads as equivalent, runs without an error, and loses something:
+    //
+    //   * say goodbye AFTER tearing down, and the frame goes onto a channel
+    //     that is already shut — trySend() eats the error and the other end
+    //     climbs the reconnect ladder exactly as if no frame existed;
+    //   * park the session AFTER going home, and goHome() has already cleared
+    //     it — for a host that is the only copy of the match;
+    //   * resume at boot BEFORE looking at `left`, and a player who pressed
+    //     LEAVE is back in their seat the next time the page loads.
+    //
+    // None of those fails a behavioural test, because main.js cannot be
+    // imported here. They are checked as text because the alternative is that
+    // they are checked by a comment.
+    {
+      const before = (body, a, b) => body.indexOf(a) !== -1 && body.indexOf(b) !== -1
+        && body.indexOf(a) < body.indexOf(b);
+
+      const lg = balanced(mainFlat, 'leaveGame() {');
+      ok(lg !== null, 'leaveGame() was found to check');
+      if (lg) {
+        // THE HOST'S HALF.
+        ok(before(lg, 'saveEngineSnapshot(engine.serialize())', 'partWith(host)'),
+          'a host flushes the engine to disk before letting go of it — the debounced write may be seconds behind');
+        ok(before(lg, 'host.broadcast(hostLeftFrame())', 'partWith(host)'),
+          'and tells the table it is going BEFORE the transport is put down');
+        ok(before(lg, 'partWith(host)', 'host = null') && before(lg, 'host = null', 'intents.goHome()'),
+          'and takes the handle out of `host` before goHome() tears down, or teardown() destroys it with the goodbye still queued');
+        // THE PLAYER'S HALF.
+        ok(before(lg, 'client.send(leaveFrame())', 'partWith(client)'),
+          'a player says goodbye before the transport is put down');
+        ok(before(lg, 'partWith(client)', 'client = null') && before(lg, 'client = null', 'intents.goHome()'),
+          'and likewise keeps the handle out of teardown()\'s reach');
+        // BOTH RECORDS ARE WRITTEN BEFORE goHome(), which decides what to keep
+        // by reading them. The other order clears first and parks nothing.
+        const parks = [...lg.matchAll(/saveSession\(\{[^}]*\}\)/g)];
+        eq(parks.length, 2, 'leaveGame() parks a session in two places — one per role');
+        for (const p of parks) {
+          ok(/left:\s*true/.test(p[0]), `and marks it left: ${p[0].replace(/\s+/g, ' ').slice(0, 60)}…`);
+          ok(p.index < lg.indexOf('intents.goHome()'), 'before goHome() reads it');
+        }
+        ok(/role:\s*'host'/.test(parks.map((p) => p[0]).join()) && /role:\s*'client'/.test(parks.map((p) => p[0]).join()),
+          'under the role that was actually being played');
+        // GATED ON THERE BEING SOMETHING TO COME BACK TO. An unconditional
+        // park would offer RESUME for a lobby, and "your seat is kept" for a
+        // seat the engine has already removed.
+        ok(before(lg, 'matchUnderWay(engine.phase)', "role: 'host'"),
+          'a host parks only a match that is under way');
+        ok(before(lg, 'holdsSeatInMatch()', "role: 'client'"),
+          'and a player only a seat that is actually being held for them');
+        ok(!lg.includes('clearSession'),
+          'and leaveGame() clears nothing itself — that is goHome()\'s decision, made after the record exists');
+        ok(!lg.includes('teardown()'),
+          'nor tears down directly, which would run before the goodbye had a handle to linger on');
+      }
+
+      // goHome() KEEPS A PARKED TABLE AND CLEARS A LIVE ONE, and asks
+      // leftTable() which is which. An unconditional clearSession() here is
+      // the old behaviour and is the edit a tidy-up would make: it reads as
+      // simpler, passes everything else in this file, and deletes a host's
+      // game the first time a resume fails on a flaky broker.
+      const gh = balanced(mainFlat, 'goHome() {');
+      ok(gh !== null, 'goHome() was found to check');
+      if (gh) {
+        ok(/app\.left\s*=\s*leftTable\(\)/.test(gh), 'goHome() asks storage whether a table was left');
+        ok(/if\s*\(!app\.left\)\s*clearSession\(\)/.test(gh), 'and clears the session only when none was');
+        eq((gh.match(/clearSession\(/g) || []).length, 1, 'with no second, unconditional clear anywhere in it');
+        ok(before(gh, 'teardown()', 'leftTable()'), 'after tearing down, so nothing still running can write a record behind it');
+      }
+
+      // BOOT OFFERS A PARKED TABLE; IT DOES NOT RESUME IT.
+      const rs = funcBody(mainFlat, 'resume');
+      ok(rs !== null, 'resume() was found to check');
+      if (rs) {
+        ok(/session\.left\s*===\s*true/.test(rs), 'resume() looks at whether the session was left');
+        const gate = rs.search(/session\.left\s*===\s*true/);
+        ok(gate !== -1 && gate < rs.indexOf('beginHost(') && gate < rs.indexOf('beginJoin('),
+          'and does so before it would dial anything');
+      }
+      // Scoped to what follows resume(), which is boot. goHome() makes the
+      // same assignment four hundred lines up, and a search of the whole file
+      // would be satisfied by that one with the boot line deleted.
+      const boot = mainFlat.slice(mainFlat.search(/function\s+resume\s*\(/));
+      ok(before(boot, 'app.left = leftTable();', 'const watchCode'),
+        'and the offer is read into app before boot paints the home screen');
+
+      // THE HOME CARD'S INTENT RE-READS STORAGE AT THE TAP. app.left is a copy
+      // made when the card was drawn; acting on it would resume whatever the
+      // record USED to say.
+      const rt = balanced(mainFlat, 'resumeTable() {');
+      ok(rt !== null, 'resumeTable() was found to check');
+      if (rt) {
+        ok(before(rt, 'leftTable()', 'beginHost(') && before(rt, 'leftTable()', 'beginJoin('),
+          'resumeTable() asks storage again before it dials');
+        ok(!/beginHost\(app\.left|beginJoin\(app\.left/.test(rt), 'and never dials from the copy in app');
+        ok(/beginHost\(table\.code,\s*loadEngineSnapshot\(\)\)/.test(rt),
+          'a host goes back through the same call a host reload makes, with the snapshot');
+        ok(!rt.includes('clearSession'),
+          'and a record that is no longer the one on the card is left alone — it may be another tab\'s');
+      }
+
+      // THE TABLE GOING AWAY, from the client's side. Both routes into it —
+      // the host's goodbye and the ladder running out — end in the same
+      // function, and it tears down BEFORE anything else so the close behind
+      // a goodbye cannot start the ladder.
+      const hg = funcBody(mainFlat, 'hostGone');
+      ok(hg !== null, 'hostGone() was found to check');
+      if (hg) {
+        ok(before(hg, 'teardown()', 'saveSession('), 'hostGone() tears down first');
+        ok(/left:\s*true/.test(hg), 'and parks the session rather than leaving it live — a reload must offer, not redial');
+        ok(/app\.screen\s*=\s*'hostleft'/.test(hg), 'and lands on the screen that says what happened');
+        ok(!hg.includes('clearSession'), 'without clearing the record that the REJOIN button depends on');
+      }
+      const ohl = balanced(clientLit || '', 'onHostLeft:');
+      ok(ohl !== null && ohl.includes('hostGone()'), 'the host\'s goodbye goes through hostGone()');
+      const sr2 = funcBody(mainFlat, 'scheduleReconnect');
+      ok(sr2 !== null && sr2.includes('hostGone()'), 'and so does a reconnect ladder that has run out of rungs');
+
+      // THE LADDER MOVES ON WHEN A RUNG IS REFUSED. A redial of a host that
+      // has gone is answered 'peer-unavailable', as an ERROR — and onError
+      // cancels the join timer on its first line. With no reschedule in it,
+      // that was the last thing that ever happened: the table sat under
+      // "reconnecting…" for good. It is asserted here because a liveTable
+      // test cannot see it — the ladder is main.js's, and main.js is not here.
+      const oe = balanced(clientLit || '', 'onError:');
+      ok(oe !== null, 'the client onError body was located');
+      if (oe) {
+        ok(oe.includes('clearJoinTimer()') && oe.includes('scheduleReconnect()'),
+          'an error on a redial books the next rung, since it has just cancelled the timer that would have');
+        ok(/resuming\s*&&/.test(oe), 'and only on a redial — a first join that fails is still an error screen');
+      }
+      const oo = balanced(clientLit || '', 'onOpen:');
+      ok(oo !== null && /clearTimeout\(reconnectTimer\)/.test(oo),
+        'and a rung that opens after all cancels the one booked behind it');
+
+      // THE HOST'S onLeave marks the seat as gone on purpose, which is the
+      // only thing that distinguishes it from onDisconnect one handler up.
+      const ol = balanced(hostLit || '', 'onLeave:');
+      ok(ol !== null && /engine\.disconnect\(playerId,\s*\{\s*left:\s*true\s*\}\)/.test(ol),
+        'the host tells the engine a seat LEFT, not merely dropped');
+      ok(ol !== null && ol.includes('push()'), 'and pushes, so the table sees it at once');
+      const od = balanced(hostLit || '', 'onDisconnect:');
+      ok(od !== null && /engine\.disconnect\(playerId\)/.test(od),
+        'while a plain disconnect still says nothing of the kind');
+
+      // A LINGERING PEER IS FINISHED OFF BEFORE A NEW ONE IS OPENED. For a
+      // host the lingering peer is holding the room code on the broker, and
+      // RESUME dials that very code.
+      const bh = funcBody(mainFlat, 'beginHost');
+      ok(bh !== null && before(bh, 'finishParting()', 'createHost('),
+        'beginHost() finishes any parting handle before it listens on the code');
+      const bj = funcBody(mainFlat, 'beginJoin');
+      ok(bj !== null && before(bj, 'finishParting()', 'joinHost('),
+        'and beginJoin() before it dials');
+      const td2 = balanced(mainFlat, 'function teardown(');
+      ok(td2 !== null && !td2.includes('finishParting'),
+        'teardown() itself does NOT — it runs straight after the goodbye, and would destroy the handle the goodbye is waiting on');
+
+      ok(/leaveFrame/.test(readRepo('js/main.js').slice(0, 4000)) && /hostLeftFrame/.test(readRepo('js/main.js').slice(0, 4000)),
+        'main.js imports both goodbye builders rather than writing the type strings itself');
+    }
   }
 
   console.log(`  main.js teardown discipline: ${guardedNames.join(', ')}`);

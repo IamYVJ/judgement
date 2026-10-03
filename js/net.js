@@ -349,7 +349,7 @@ export function connIdForPlayer(playerId) {
 // file and read in another is two opinions about a format, and they drift. The
 // pair cannot.
 //
-// Four types is the whole protocol on top of the intents. Anything else that
+// Seven types is the whole protocol on top of the intents. Anything else that
 // arrives is handed to the caller's onData, where applyGameIntent() gets a
 // look at it and an unrecognised type is a no-op — which is what lets a newer
 // client talk to an older host without either of them crashing.
@@ -383,13 +383,42 @@ export function connIdForPlayer(playerId) {
 // behaviour degrades to exactly what it was before this frame existed, which is
 // why the guard is here and not the only thing standing between two tabs and a
 // loop.
+//
+// ---------------------------------------------------------------------------
+// AND THE TWO GOODBYES, WHICH ARE THE SAME ARGUMENT FROM EACH END
+// ---------------------------------------------------------------------------
+// A channel that closes says nothing about WHY, and both ends guess the same
+// way: it was an accident, so wait for it to be undone. That guess is right
+// for a tunnel and wrong for a person who pressed LEAVE, and it is wrong in a
+// way that costs the people who stayed.
+//
+//   LEAVE      A player going on purpose. Without it the host hears a close,
+//              marks the seat disconnected, and holds every one of that seat's
+//              turns for the offline grace before a bot covers it — ten seconds
+//              a turn, for the rest of the match, waiting on somebody who has
+//              said they are not coming.
+//
+//   HOSTLEFT   The host going on purpose, taking the engine with it. Without
+//              it every client climbs the whole reconnect ladder first, which
+//              is most of half a minute of "reconnecting…" to a table that was
+//              put down deliberately and may be picked up again later.
+//
+// Like REPLACED, each is a fact the other end cannot observe, carries nothing,
+// decides nothing, and is best-effort: sent as the channel is about to close,
+// so it can be lost, and when it is lost what happens is exactly what happened
+// before either frame existed. Neither grants anything. A LEAVE can only ever
+// vacate the sender's own seat, which closing the channel would do anyway, and
+// a HOSTLEFT from a table that is still there is a host choosing to stop
+// talking to you, which it could do without a frame.
 // ---------------------------------------------------------------------------
 export const WIRE = Object.freeze({
   JOIN: 'join',          // client -> host, once per connection, on open
   WATCH: 'watch',        // client -> host, once per connection, on open
+  LEAVE: 'leave',        // client -> host, last words: this seat is going on purpose
   STATE: 'state',        // host -> client, on every change
   REJECTED: 'rejected',  // host -> client, a refusal meant for the sender alone
   REPLACED: 'replaced',  // host -> client, last words: your seat moved elsewhere
+  HOSTLEFT: 'hostleft',  // host -> client, last words: the host has put the table down
 });
 
 /** A refusal is one sentence for a human, so it is capped at one sentence's
@@ -558,6 +587,38 @@ export function isReplacedFrame(msg) {
   return !!msg && msg.type === WIRE.REPLACED;
 }
 
+/**
+ * A player's last words: I am leaving, and it is not an accident. See the note
+ * above WIRE.
+ *
+ * NOTHING IN IT, for replacedFrame()'s reason. In particular it does not name
+ * a seat or a ticket: the host already knows which connection the frame came
+ * in on, and that connection is the only seat it can ever speak for. A frame
+ * that named one would be a frame that could name somebody else's.
+ */
+export function leaveFrame() {
+  return { type: WIRE.LEAVE };
+}
+
+export function isLeaveFrame(msg) {
+  return !!msg && msg.type === WIRE.LEAVE;
+}
+
+/**
+ * The host's last words to everybody at once: the table has been put down on
+ * purpose. Not "the match is over" and not "come back later" — the host does
+ * not know which it will turn out to be, so the frame does not say. What a
+ * client does with the fact is js/main.js's business, and its answer is to stop
+ * redialling and offer a way back in for when there is something to dial.
+ */
+export function hostLeftFrame() {
+  return { type: WIRE.HOSTLEFT };
+}
+
+export function isHostLeftFrame(msg) {
+  return !!msg && msg.type === WIRE.HOSTLEFT;
+}
+
 // ---------------------------------------------------------------------------
 // Is PeerJS actually here?
 //
@@ -700,8 +761,8 @@ function attachBrokerRecovery(peer, handlers = {}) {
  * handlers: onOpen(code), onConnect(playerId),
  *           onJoin(playerId, { name, clientId } | null),
  *           onWatch(playerId, accepted),
- *           onData(playerId, msg), onDisconnect(playerId), onError(err),
- *           onBrokerDown(), onBrokerUp(), onBrokerLost()
+ *           onData(playerId, msg), onLeave(playerId), onDisconnect(playerId),
+ *           onError(err), onBrokerDown(), onBrokerUp(), onBrokerLost()
  *
  * EVERY ID HANDED TO A HANDLER IS ALREADY A PLAYER ID — prefixed, per the
  * security note above — so a caller cannot forget to do it. The connection id
@@ -719,6 +780,13 @@ function attachBrokerRecovery(peer, handlers = {}) {
  * of a slot (see MAX_WATCHERS) — the refusal is reported rather than acted on
  * here, because a refusal is a sentence for a human and this file does not
  * write sentences.
+ *
+ * onLeave and onDisconnect are ONE EVENT WITH TWO CAUSES, and a connection
+ * fires exactly one of them, once. onLeave is a device that said goodbye first;
+ * onDisconnect is one that simply stopped. The channel closes either way, and
+ * the close that follows a goodbye is swallowed here rather than reported a
+ * second time — otherwise the caller would be told the same seat had gone
+ * twice, and the second telling would overwrite "left" with "disconnected".
  *
  * Note what a watcher does NOT change. It is an ordinary connection in every
  * other respect, so it counts against MAX_HOST_CONNS, it gets its own token
@@ -865,6 +933,28 @@ export function createHost(code, handlers = {}) {
         // slider sends one message per step. A client still going after the
         // bucket is empty is not playing.
         refuse();
+        return;
+      }
+
+      // A GOODBYE, and the connection is finished with as soon as it is read.
+      //
+      // Taken out of the map BEFORE the caller is told and before the close,
+      // which is dropConnection()'s trick used for the same purpose: the
+      // close handler below only reports a disconnect for the connection the
+      // map still holds, so removing it here is what makes this one event and
+      // not two. The same test guards the report, because a stale connection
+      // — one whose seat a reconnect has already taken — must not be able to
+      // vacate that seat by saying goodbye late, any more than by closing late.
+      //
+      // Closed from this end rather than left for the sender to do: the sender
+      // is on its way out and may not get that far, and a connection that has
+      // said it is leaving has nothing further to say that should be heard.
+      if (isLeaveFrame(msg)) {
+        if (connections.get(conn.peer) === conn) {
+          connections.delete(conn.peer);
+          if (handlers.onLeave) handlers.onLeave(playerIdForConn(conn.peer));
+        }
+        try { conn.close(); } catch (_) {}
         return;
       }
 
@@ -1023,14 +1113,19 @@ export function createHost(code, handlers = {}) {
 /**
  * Dial the host at the address derived from `code`.
  *
- * handlers: onOpen(), onState(pub, priv), onReplaced(), onData(msg), onClose(),
- *           onError(err), onBrokerDown(), onBrokerUp(), onBrokerLost()
+ * handlers: onOpen(), onState(pub, priv), onReplaced(), onHostLeft(),
+ *           onData(msg), onClose(), onError(err),
+ *           onBrokerDown(), onBrokerUp(), onBrokerLost()
  *
  * onReplaced() is immediately followed by onClose(), always — the host sends
  * the frame and then closes the channel. A caller that acts on the first must
  * therefore make the second inert, because the close by itself is
  * indistinguishable from a dropped connection and "reconnect" is the right
  * answer to that one.
+ *
+ * onHostLeft() is the same shape for the same reason: the host says it is
+ * going and then goes, so a close is on its way behind the frame, and the
+ * caller has to have stopped listening for it by the time it lands.
  *
  * `identity` is { name, clientId }, or WATCHER. When it is given — which is
  * every real call — the hello is sent by this function, on open, before onOpen
@@ -1103,6 +1198,14 @@ export function joinHost(code, handlers = {}, identity = null) {
       // fired and the redial is already scheduled.
       if (isReplacedFrame(msg)) {
         if (handlers.onReplaced) handlers.onReplaced();
+        return;
+      }
+
+      // And this one, for exactly that reason: what follows it is a close, and
+      // the difference between "the host left" and "the host dropped" is the
+      // difference between a screen that says so and a ladder of redials.
+      if (isHostLeftFrame(msg)) {
+        if (handlers.onHostLeft) handlers.onHostLeft();
         return;
       }
 

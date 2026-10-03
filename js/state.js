@@ -262,6 +262,8 @@ export class GameEngine {
       isOwner: isOwner || seat === 0,
       isBot: false,
       connected: true,
+      // Away ON PURPOSE, as opposed to merely not connected. See disconnect().
+      left: false,
     });
     if (this.seats[seat].isOwner) this.ownerId = id;
     this._say(`${this.seats[seat].name} joined`, 'join', seat);
@@ -273,6 +275,8 @@ export class GameEngine {
     const fresh = !s.connected;
     s.id = id;
     s.connected = true;
+    // Whoever is holding the ticket is back, so however they went is history.
+    s.left = false;
     // A reconnecting player may have changed their name in the meantime; take
     // it, because the alternative is telling somebody their own name is wrong.
     // Not mid-match though: the scoreboard and the log already say the old one
@@ -317,8 +321,23 @@ export class GameEngine {
    * hands, bids and running totals to the wrong people — and the clientId
    * reclaim in addPlayer() has nothing to match against if the record is
    * gone, so removing the seat is also what makes the reconnect impossible.
+   *
+   * `left` IS THE DIFFERENCE BETWEEN A TUNNEL AND A GOODBYE. Both leave the
+   * seat exactly as described above — same hand, same score, same ticket, and
+   * the same way back through addPlayer(). What changes is how long the table
+   * waits for it. A phone that dropped is probably seconds from returning, so
+   * js/bot.js holds its turn for a grace period before covering it; a player
+   * who pressed LEAVE has said they are not, and making six people sit through
+   * that grace on every one of that seat's turns would punish the people who
+   * stayed. The flag is the only thing that tells the two apart, it is only
+   * ever set from the departing device's own last frame, and _reclaim() clears
+   * it the moment the ticket comes back.
    */
-  disconnect(id) {
+  disconnect(id, options = null) {
+    // Read strictly, and not destructured in the signature: `{ left } = {}`
+    // throws on a null and takes any truthy value, and "truthy" is how a stray
+    // string from some later caller turns a tunnel into a goodbye.
+    const left = !!options && options.left === true;
     const seat = this.seatOf(id);
     if (seat === -1) return { ok: false, error: 'not seated' };
     const who = this.seats[seat].name;
@@ -334,7 +353,8 @@ export class GameEngine {
     }
 
     this.seats[seat].connected = false;
-    this._say(`${who} disconnected`, 'leave', seat);
+    this.seats[seat].left = left;
+    this._say(`${who} ${left ? 'left' : 'disconnected'}`, 'leave', seat);
     return { ok: true, seat };
   }
 
@@ -363,6 +383,7 @@ export class GameEngine {
       // A bot is never disconnected. Nothing should ever wait on one, and a
       // "waiting for Robin" that can never clear is a hung game.
       connected: true,
+      left: false,
     });
     this._say(`${this.seats[seat].name} (bot) joined`, 'join', seat);
     return { ok: true, seat };
