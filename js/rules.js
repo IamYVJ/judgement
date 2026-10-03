@@ -223,9 +223,9 @@ export function cleanName(raw) {
 //  THE FOUR AXES
 //
 //  Everything below is the host's choice of game. There are exactly four
-//  axes, they are independent, and together they make 3 x 3 x 3 x 2 = 54
+//  axes, they are independent, and together they make 4 x 3 x 3 x 2 = 72
 //  playable games. That number is asserted in scripts/test-engine.mjs, not
-//  because 54 matters but because a fifth axis added quietly here is a fifth
+//  because 72 matters but because a fifth axis added quietly here is a fifth
 //  axis the bot and the scoreboard were never told about.
 //
 //    scoring      how a round is worth points          js/scoring.js
@@ -516,7 +516,8 @@ export function matchShape(config, players) {
 export const SCORING_LABELS = table({
   kachuful: { label: 'Kachuful', blurb: 'Ten times your bid, nothing for a miss. A made zero pays five a trick. Bid bravely.' },
   standard: { label: 'Standard', blurb: 'Ten for making it, plus one a trick. Ambition pays almost nothing — call it as you see it.' },
-  square: { label: 'Square', blurb: 'Ten plus your bid squared, and the square of your error against you. The only mode that bites.' },
+  square: { label: 'Square', blurb: 'Ten plus your bid squared, and the square of your error against you. A miss takes points away.' },
+  puresquare: { label: 'Pure square', blurb: 'Your bid squared and no ten on top — a made zero pays two a card. The square of your error against you.' },
 });
 
 export const TRUMP_METHOD_LABELS = table({
@@ -541,11 +542,17 @@ export function axisLabel(labels, value) {
 // ---------------------------------------------------------------------------
 // Presets
 //
-// Three POINTS in the 54-game space, not three special modes — picking one
+// Three POINTS in the 72-game space, not three special modes — picking one
 // sets the four toggles and nothing else happens. Changing any toggle
 // afterwards leaves you on a config that matches no preset, which is what
 // presetMatching() is for and what the lobby shows as "Custom". Same pattern as
 // sequence's lobby.
+//
+// THREE PRESETS AND FOUR SCORING MODES, on purpose. `puresquare` has no preset
+// of its own: it is a variation the host switches on from the scoring row, and
+// a table that picks it is on a Custom game like any other. A fourth preset
+// would be a fourth named game, with a trump method and a shape chosen for it
+// by nobody.
 // ---------------------------------------------------------------------------
 
 export const PRESETS = Object.freeze([

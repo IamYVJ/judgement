@@ -51,7 +51,7 @@ import {
   buildDeck, shuffle, deal, emptyHands, sortHand, suitCounts,
 } from '../js/cards.js';
 import {
-  SCORING_MODES, scoreKachuful, scoreStandard, scoreSquare, scoreRound,
+  SCORING_MODES, scoreKachuful, scoreStandard, scoreSquare, scorePureSquare, scoreRound,
 } from '../js/scoring.js';
 // Only the names the engine itself adds. Everything else state.js re-exports
 // is already imported above from the module that defines it, and importing it
@@ -951,16 +951,148 @@ ok(deepest < 0, 'and the running total is below zero on the way there');
 ok(scoreSquare(0, 10, 10) < -99, 'a player who ducks a zero bid and takes the lot is a hundred down');
 
 // ===========================================================================
-section('Scoring: the three modes are three different games');
+section('Scoring: Pure square, where the prize and the penalty are one curve');
 // ===========================================================================
 
-same(SCORING_MODES, ['kachuful', 'standard', 'square'],
+// THE RULE AS IT WAS ASKED FOR, one clause to a line, so that a reader can put
+// this next to the request and tick them off:
+//
+//   "the positive score will be square of sets made"
+eq(scorePureSquare(1, 1, 10), 1, 'a made one scores one');
+eq(scorePureSquare(2, 2, 10), 4, 'a made two scores four');
+eq(scorePureSquare(4, 4, 10), 16, 'a made four scores sixteen');
+eq(scorePureSquare(10, 10, 10), 100, 'a made ten scores a hundred');
+//   "if 0, it will be 2 x cards in the round"
+eq(scorePureSquare(0, 0, 10), 20, 'a made zero in a ten-card round scores twenty');
+eq(scorePureSquare(0, 0, 1), 2, 'in a one-card round, two');
+eq(scorePureSquare(0, 0, 17), 34, 'and in the biggest round the deck allows, thirty-four');
+//   "negative will be delta of sets made and guessed squared"
+eq(scorePureSquare(3, 4, 10), -1, 'one over costs one');
+eq(scorePureSquare(3, 1, 10), -4, 'two under costs four');
+eq(scorePureSquare(3, 6, 10), -9, 'three over costs nine');
+eq(scorePureSquare(3, 0, 10), -9, 'and three under costs the same nine');
+eq(scorePureSquare(0, 2, 10), -4, 'a MISSED zero is a miss like any other — the square of what was taken, not the zero bonus');
+
+// NO FLAT TEN, and that is the whole difference from Square. Stated as the
+// difference rather than as two tables, so the two formulas cannot drift into
+// agreeing: for every bid of one or more, Square pays exactly ten more.
+{
+  let wrongGap = 0, compared = 0;
+  for (let R = 1; R <= 17; R++) {
+    for (let bid = 1; bid <= R; bid++) {
+      compared++;
+      if (scoreSquare(bid, bid, R) - scorePureSquare(bid, bid, R) !== 10) wrongGap++;
+      if (scorePureSquare(bid, bid, R) !== bid * bid) wrongGap++;
+    }
+  }
+  ok(compared > 100, `${compared} made bids of one or more compared against Square`);
+  eq(wrongGap, 0, 'each is worth the bid squared, which is exactly Square with its ten taken off');
+}
+
+// THE PENALTY IS SQUARE'S, TO THE DIGIT. The request describes it in the same
+// words Square already uses, so the two are compared over every miss there is
+// rather than re-stated — a second copy of "minus the error squared" would be
+// right today and would be the one that was not updated.
+{
+  let differs = 0, asym = 0, free = 0, misses = 0;
+  for (let R = 1; R <= 17; R++) {
+    for (let bid = 0; bid <= R; bid++) {
+      for (let actual = 0; actual <= R; actual++) {
+        if (actual === bid) continue;
+        misses++;
+        const cost = scorePureSquare(bid, actual, R);
+        if (cost !== scoreSquare(bid, actual, R)) differs++;
+        if (cost !== -((actual - bid) ** 2)) differs++;
+        if (cost >= 0) free++;
+        // Over by k and under by k, where both ends exist in this round.
+        const mirror = bid - (actual - bid);
+        if (mirror >= 0 && mirror <= R && scorePureSquare(bid, mirror, R) !== cost) asym++;
+      }
+    }
+  }
+  ok(misses > 1500, `${misses} misses swept, at every round size the deck allows`);
+  eq(differs, 0, 'every one costs the square of the error, which is exactly what Square charges for it');
+  eq(free, 0, 'no miss is free — not by one, and not on a zero bid');
+  eq(asym, 0, 'and over and under by the same amount cost the same');
+}
+
+// "THE NEGATIVE WILL BE THE SAME AS THE POSITIVE". The prize for a bid and the
+// penalty for missing it by that many are the same number with the sign
+// turned over, which is the property that gives the mode its name: nothing
+// sits on top of either side. Square cannot say this — its ten breaks it.
+{
+  let mirrored = 0, squareMirrors = 0;
+  for (let bid = 1; bid <= 17; bid++) {
+    // Bidding `bid` and taking none is being out by exactly `bid`.
+    if (scorePureSquare(bid, bid, 17) === -scorePureSquare(bid, 0, 17)) mirrored++;
+    if (scoreSquare(bid, bid, 17) === -scoreSquare(bid, 0, 17)) squareMirrors++;
+  }
+  eq(mirrored, 17, 'what a bid wins is exactly what missing it by that many costs, at every bid from 1 to 17');
+  eq(squareMirrors, 0, 'which is true of no bid at all under Square — so the two modes are not one mode');
+}
+
+// THE ZERO RULE, and why it scales. Zero squared is zero: without the rule a
+// made zero would pay nothing and still cost a square to miss, and nobody
+// would ever bid it. Paying by ROUND SIZE is what keeps it a real choice in
+// every round — it is always worth more than a made one and less than making
+// most of the round.
+{
+  let worthless = 0, notScaling = 0, beatsOne = 0, rounds = 0;
+  for (let R = 1; R <= 17; R++) {
+    rounds++;
+    const zero = scorePureSquare(0, 0, R);
+    if (zero <= 0) worthless++;
+    if (zero !== 2 * R) notScaling++;
+    if (zero > scorePureSquare(1, 1, R)) beatsOne++;
+  }
+  eq(worthless, 0, 'a made zero is worth something in every round');
+  eq(notScaling, 0, 'and exactly twice the round size, so a harder duck pays more');
+  eq(beatsOne, rounds, 'which is more than a made one in every round — ducking is never the worse bid of the two');
+  // Where it sits among the other bids in the round the rules sheet uses.
+  ok(scorePureSquare(4, 4, 10) < scorePureSquare(0, 0, 10) && scorePureSquare(0, 0, 10) < scorePureSquare(5, 5, 10),
+    'in a ten-card round a made zero (20) sits between a made four (16) and a made five (25)');
+  // And the round size reaches NOTHING else in the formula.
+  let leaks = 0;
+  for (let bid = 0; bid <= 5; bid++) {
+    for (let actual = 0; actual <= 5; actual++) {
+      if (bid === 0 && actual === 0) continue;
+      if (scorePureSquare(bid, actual, 5) !== scorePureSquare(bid, actual, 17)) leaks++;
+    }
+  }
+  eq(leaks, 0, 'the round size changes the made zero and no other cell');
+}
+
+// Negative running totals, as under Square — and deeper, with no ten to climb
+// back on. The same four rounds that leave Square on +7 leave this one below
+// where it started.
+{
+  let total = 0;
+  for (const [bid, actual] of SQUARE_MATCH) total += scorePureSquare(bid, actual, 10);
+  eq(total, -3, 'three misses of two against one made three leaves minus three');
+  ok(total < squareTotal, `where Square, with its ten, was on ${squareTotal}`);
+}
+
+// ===========================================================================
+section('Scoring: the four modes are four different games');
+// ===========================================================================
+
+same(SCORING_MODES, ['kachuful', 'standard', 'square', 'puresquare'],
   'the modes, in the order the lobby offers them');
 ok(Object.isFrozen(SCORING_MODES), 'and the list is frozen');
 
 // If two modes agreed about what a bid is worth there would be no reason for
 // the host to choose between them. Each pair has to disagree somewhere.
-const MODE_PAIRS = [['kachuful', 'standard'], ['kachuful', 'square'], ['standard', 'square']];
+//
+// EVERY PAIR, DERIVED. This was three pairs typed out, which is every pair of
+// three and is one pair short of every pair of four the moment a fourth mode
+// lands — and the pair it would have missed is the one most likely to be
+// wrong, because the new mode is always a variation on an old one.
+const MODE_PAIRS = [];
+for (let i = 0; i < SCORING_MODES.length; i++) {
+  for (let j = i + 1; j < SCORING_MODES.length; j++) MODE_PAIRS.push([SCORING_MODES[i], SCORING_MODES[j]]);
+}
+eq(MODE_PAIRS.length, (SCORING_MODES.length * (SCORING_MODES.length - 1)) / 2,
+  `${MODE_PAIRS.length} pairs, which is every pair there is`);
 for (const [a, b] of MODE_PAIRS) {
   let differs = false;
   for (let bid = 0; bid <= 10 && !differs; bid++) {
@@ -971,8 +1103,9 @@ for (const [a, b] of MODE_PAIRS) {
   ok(differs, `${a} and ${b} score some round differently`);
 }
 
-// The one structural difference, stated as a property: only square can take
-// points away, and it does so on EVERY miss.
+// The one structural difference, stated as a property: the modes split cleanly
+// into the two where a miss is free and the two where it costs — and it is
+// all-or-nothing within a mode. There is no mode where SOME misses are free.
 let loose = 0, punishing = 0;
 for (let bid = 0; bid <= 10; bid++) {
   for (let actual = 0; actual <= 10; actual++) {
@@ -980,10 +1113,32 @@ for (let bid = 0; bid <= 10; bid++) {
     if (scoreRound('kachuful', bid, actual, 10) === 0) loose++;
     if (scoreRound('standard', bid, actual, 10) === 0) loose++;
     if (scoreRound('square', bid, actual, 10) < 0) punishing++;
+    if (scoreRound('puresquare', bid, actual, 10) < 0) punishing++;
   }
 }
 eq(loose, 220, 'every miss in kachuful and standard is free');
-eq(punishing, 110, 'and every miss in square costs something');
+eq(punishing, 220, 'and every miss in square and pure square costs something');
+
+/**
+ * WHICH MODES CAN TAKE POINTS AWAY, asked of the formulas rather than typed.
+ *
+ * Three later sections need this — the exhaustive sweep, the rules sheet and
+ * the lobby blurbs — and each used to carry the answer as the literal string
+ * 'square'. That was right for as long as there was one such mode, and the
+ * day a second arrived every one of them was a sentence saying "square is the
+ * only mode that can go negative" with nothing to make it stop saying so.
+ */
+const PENALISING = SCORING_MODES.filter((mode) => {
+  for (let R = 1; R <= 17; R++) {
+    for (let bid = 0; bid <= R; bid++) {
+      for (let actual = 0; actual <= R; actual++) {
+        if (scoreRound(mode, bid, actual, R) < 0) return true;
+      }
+    }
+  }
+  return false;
+});
+same(PENALISING, ['square', 'puresquare'], 'two modes can take points away, and they are the two square ones');
 
 // ===========================================================================
 section('Scoring: the dispatcher');
@@ -992,11 +1147,31 @@ section('Scoring: the dispatcher');
 eq(scoreKachuful.length, 3, 'scoreKachuful takes bid, actual and round size');
 eq(scoreStandard.length, 3, 'so does scoreStandard, though it ignores the round size');
 eq(scoreSquare.length, 3, 'and so does scoreSquare — a uniform signature is what makes the table lookup possible');
+eq(scorePureSquare.length, 3, 'and scorePureSquare, which does read the round size, for the made zero');
 eq(scoreRound.length, 4, 'scoreRound takes the mode in front of those three');
 
 eq(scoreRound('kachuful', 0, 0, 7), scoreKachuful(0, 0, 7), 'scoreRound dispatches to kachuful');
 eq(scoreRound('standard', 4, 4, 7), scoreStandard(4, 4, 7), 'to standard');
-eq(scoreRound('square', 4, 6, 7), scoreSquare(4, 6, 7), 'and to square');
+eq(scoreRound('square', 4, 6, 7), scoreSquare(4, 6, 7), 'to square');
+// THREE CELLS, because the two square modes agree on every miss: a dispatch
+// that sent `puresquare` to scoreSquare would pass on a miss and only show on
+// a made bid, and on a made zero it shows as the round-size rule going missing.
+eq(scoreRound('puresquare', 4, 6, 7), scorePureSquare(4, 6, 7), 'and to pure square, on a miss');
+eq(scoreRound('puresquare', 4, 4, 7), 16, 'on a made bid, where it is NOT what square pays');
+eq(scoreRound('puresquare', 0, 0, 7), 14, 'and on a made zero, where the round size reaches it');
+
+// EVERY MODE HAS ITS OWN FORMULA, asked of the table rather than of the names
+// above. Two modes sharing one function would make the lobby offer a choice
+// between two labels for the same game.
+{
+  const fingerprint = (mode) => {
+    const cells = [];
+    for (let bid = 0; bid <= 6; bid++) for (let a = 0; a <= 6; a++) cells.push(scoreRound(mode, bid, a, 6));
+    return cells.join(',');
+  };
+  eq(new Set(SCORING_MODES.map(fingerprint)).size, SCORING_MODES.length,
+    `all ${SCORING_MODES.length} modes score a six-card round differently from one another`);
+}
 
 // A mode in the lobby's list with no formula behind it would throw halfway
 // through somebody's match, after the bids were in.
@@ -1023,7 +1198,11 @@ section('Scoring: every mode, every round size, every bid, every outcome');
 
 // Exhaustive over the whole legal space — 3 players at seventeen cards is the
 // largest round the deck allows, so no real match reaches past R = 17.
-let nonInteger = 0, negativeOutsideSquare = 0, madeBidPunished = 0, cells = 0;
+let nonInteger = 0, negativeWhereFree = 0, madeBidPunished = 0, missRewarded = 0, cells = 0;
+// The widest any single cell gets, either way. js/ui.js's score pad was sized
+// against these two numbers (see the SIZING note above scorePad()), so a mode
+// that pushed either of them out would overflow a column nobody re-measured.
+let lowest = 0, highest = 0;
 for (const mode of SCORING_MODES) {
   for (let R = 1; R <= 17; R++) {
     for (let bid = 0; bid <= R; bid++) {
@@ -1031,25 +1210,38 @@ for (const mode of SCORING_MODES) {
         const score = scoreRound(mode, bid, actual, R);
         cells++;
         if (!Number.isInteger(score)) nonInteger++;
-        if (score < 0 && mode !== 'square') negativeOutsideSquare++;
+        if (score < 0 && !PENALISING.includes(mode)) negativeWhereFree++;
         if (actual === bid && score <= 0) madeBidPunished++;
+        if (actual !== bid && score > 0) missRewarded++;
+        lowest = Math.min(lowest, score);
+        highest = Math.max(highest, score);
       }
     }
   }
 }
 ok(cells > 2000, `the whole legal scoring space is covered: ${cells} cells`);
 eq(nonInteger, 0, 'every score is a whole number — no mode can produce a fraction to render');
-eq(negativeOutsideSquare, 0, 'square is the only mode that can take points away');
+eq(negativeWhereFree, 0, 'the modes that do not penalise never take a point away, in any cell');
 eq(madeBidPunished, 0, 'and making your bid is always worth something, in every mode and every round');
+// THE SCOREBOARD LEANS ON THESE TWO TOGETHER. padCell() in js/ui.js colours a
+// cell by the SIGN of its points and draws no tick: positive is made, anything
+// else is missed. That is only honest while no mode pays for a miss and none
+// pays nothing for a make — and pure square is the mode that could have broken
+// it twice, with a made zero worth zero squared and a made one worth one.
+eq(missRewarded, 0, 'and no miss is ever worth a point, so the sign of a score says whether the bid was made');
+eq(lowest, -289, 'the worst single round is minus seventeen squared');
+eq(highest, 299, 'and the best is ten plus seventeen squared — the four-character cells the score pad was measured for');
 
 // ===========================================================================
 section('The four axes');
 // ===========================================================================
 
-// Not a fact about the number 54 — a fact about there being FOUR axes. A fifth
+// Not a fact about the number 72 — a fact about there being FOUR axes. A fifth
 // added quietly is a fifth the bot and the scoreboard were never told about.
-eq(SCORING_MODES.length * TRUMP_METHODS.length * ROUND_SHAPES.length * 2, 54,
-  'three scoring modes x three trump methods x three shapes x the hook is 54 playable games');
+// (It was 54 until the fourth scoring mode; the axes did not change, one of
+// them grew a value.)
+eq(SCORING_MODES.length * TRUMP_METHODS.length * ROUND_SHAPES.length * 2, 72,
+  'four scoring modes x three trump methods x three shapes x the hook is 72 playable games');
 ok(Object.isFrozen(TRUMP_METHODS) && Object.isFrozen(ROUND_SHAPES), 'the axis lists are frozen');
 eq(Object.keys(DEFAULT_CONFIG).length, 5, 'a config is the four axes plus the biggest hand, and nothing else');
 ok(Object.isFrozen(DEFAULT_CONFIG), 'and the default is frozen');
@@ -1351,9 +1543,30 @@ same(BY_ID.classic, { scoring: 'standard', trumpMethod: 'turnup', shape: 'descen
 same(BY_ID.cutthroat, { scoring: 'square', trumpMethod: 'rotation-nt', shape: 'downup', hook: true, maxHand: null },
   'Cutthroat: square scoring, the No Trump rotation, the hook, down and back up');
 
-// Three points, and between them they touch every value on every axis — which
-// is what makes them a tour of the game rather than three variations on one.
-for (const mode of SCORING_MODES) ok(PRESETS.some((p) => p.config.scoring === mode), `a preset uses ${mode} scoring`);
+// Three points, and between them they touch every trump method and three
+// different scorings — which is what makes them a tour of the game rather than
+// three variations on one.
+//
+// NOT EVERY SCORING MODE, since the fourth. This loop used to run over
+// SCORING_MODES and require a preset for each, which was true of three modes
+// and three presets by construction. Pure square is a variation the host turns
+// on from the scoring row; it has no named game of its own, and inventing one
+// to satisfy a loop would mean choosing a trump method and a shape for it on
+// nobody's behalf. So the claim is restated as the two things that are still
+// true and still worth holding: no two presets share a scoring, and every
+// scoring a preset names is one the lobby really offers.
+eq(new Set(PRESETS.map((p) => p.config.scoring)).size, PRESETS.length, 'no two presets share a scoring mode');
+for (const p of PRESETS) ok(SCORING_MODES.includes(p.config.scoring), `${p.id}: '${p.config.scoring}' is a mode the lobby offers`);
+const UNPRESET = SCORING_MODES.filter((mode) => !PRESETS.some((p) => p.config.scoring === mode));
+same(UNPRESET, ['puresquare'], 'and exactly one mode is reachable only from the scoring row');
+// Which is not a dead end: picking it from any preset is a legal config, it
+// survives the allow-list, and the lobby reads it as Custom rather than as
+// whichever preset it started from.
+for (const p of PRESETS) {
+  const varied = normalizeConfig({ ...p.config, scoring: UNPRESET[0] });
+  eq(varied.scoring, UNPRESET[0], `${p.id} with the scoring switched keeps the scoring it was switched to`);
+  eq(presetMatching(varied), null, 'and is a Custom game, not still that preset');
+}
 for (const m of TRUMP_METHODS) ok(PRESETS.some((p) => p.config.trumpMethod === m), `a preset uses the ${m} trump`);
 
 let presetDrift = 0;
@@ -1385,6 +1598,31 @@ for (const [labels, values] of [[SCORING_LABELS, SCORING_MODES], [TRUMP_METHOD_L
   }
 }
 eq(unlabelled, 0, 'every value on every axis has a name and a sentence explaining it');
+
+// THE CHIPS ARE DRAWN IN THE LABEL TABLE'S ORDER, not in SCORING_MODES' — the
+// lobby's picker walks Object.keys() of the labels. So the two orders have to
+// be the same order, and a mode with a formula and no label would be a mode
+// nobody can select while one with a label and no formula throws at the end of
+// the first round it is picked for.
+same(Object.keys(SCORING_LABELS), SCORING_MODES, 'the scoring chips are offered in the order the modes are listed, with none missing and none extra');
+eq(new Set(SCORING_MODES.map((m) => SCORING_LABELS[m].label)).size, SCORING_MODES.length,
+  'and no two of them share a name on the chip');
+
+// WHAT EACH BLURB SAYS ABOUT A MISS IS WHAT THE FORMULA DOES ABOUT ONE. The
+// blurb is the only explanation the host sees at the moment of choosing, and
+// Square's used to end "the only mode that bites" — true for as long as it
+// was, and still sitting there the day a second one did.
+for (const mode of SCORING_MODES) {
+  const blurb = SCORING_LABELS[mode].blurb;
+  eq(/against you|takes points away/i.test(blurb), PENALISING.includes(mode),
+    `${mode}: the blurb ${PENALISING.includes(mode) ? 'warns' : 'does not warn'} that a miss costs points`);
+  ok(!/\bonly mode\b/i.test(blurb), `${mode}: and makes no claim to being the only mode that does anything`);
+}
+// And the two numbers pure square's blurb states.
+ok(/two a card/i.test(SCORING_LABELS.puresquare.blurb) && scoreRound('puresquare', 0, 0, 7) === 2 * 7,
+  'pure square\'s blurb says a made zero pays two a card, and it does');
+ok(/no ten/i.test(SCORING_LABELS.puresquare.blurb) && scoreRound('puresquare', 3, 3, 7) === scoreRound('square', 3, 3, 7) - 10,
+  'and that there is no ten on top, which is the ten square pays and it does not');
 eq(axisLabel(SHAPE_LABELS, 'downup'), 'Down and back up', 'the shape the host most needs warning about');
 eq(axisLabel(SCORING_LABELS, 'sideways'), 'sideways', 'an unknown value renders as itself, not as blank space');
 eq(axisLabel(SCORING_LABELS, 'toString'), 'toString', 'and an inherited key is not a label');
@@ -2719,17 +2957,48 @@ section('The engine: the scoreboard, negatives and all');
     'the leader marker names everybody on the top score');
 }
 
-// The three modes over one identical deal produce three different matches —
-// the same assertion made in section 2 about the formulas, made again about
-// whole matches, because a mode that never reached the scorer would pass the
-// first and fail this.
+// Every mode over one identical deal produces a different match — the same
+// assertion made in section 2 about the formulas, made again about whole
+// matches, because a mode that never reached the scorer would pass the first
+// and fail this.
 {
-  const totalsByMode = SCORING_MODES.map((scoring) => playMatch({
+  const matches = SCORING_MODES.map((scoring) => playMatch({
     config: { scoring, trumpMethod: 'rotation', shape: 'descending', maxHand: 4 },
     players: 4, strategy: 'random', shuffleSeed: 555, pickerSeed: 555,
-  }).totals.join(','));
+  }));
+  const totalsByMode = matches.map((g) => g.totals.join(','));
   eq(new Set(totalsByMode).size, SCORING_MODES.length,
-    'three scoring modes over the same deal give three different scoreboards');
+    `${SCORING_MODES.length} scoring modes over the same deal give ${SCORING_MODES.length} different scoreboards`);
+
+  // AND EACH OF THOSE SCOREBOARDS IS ITS OWN MODE'S ARITHMETIC, cell by cell.
+  // "Different" is satisfied by a mode that reached the WRONG formula — pure
+  // square quietly scored as square is a different scoreboard from kachuful's
+  // and would pass the line above. So every delta in every completed round is
+  // recomputed from the bid, the tricks and the round size the record itself
+  // carries, under the mode the match was configured with.
+  SCORING_MODES.forEach((scoring, i) => {
+    const g = matches[i];
+    let drift = 0, cells = 0, made = 0, madeZero = 0;
+    const running = new Array(g.seats.length).fill(0);
+    for (const h of g.history) {
+      for (let seat = 0; seat < g.seats.length; seat++) {
+        cells++;
+        const want = scoreRound(scoring, h.bids[seat], h.tricks[seat], h.roundSize);
+        if (h.deltas[seat] !== want) drift++;
+        running[seat] += want;
+        if (h.totals[seat] !== running[seat]) drift++;
+        if (h.bids[seat] === h.tricks[seat]) { made++; if (h.bids[seat] === 0) madeZero++; }
+      }
+    }
+    eq(g.config.scoring, scoring, `${scoring}: the match ran under the mode it was configured with`);
+    ok(cells >= 16, `${scoring}: ${cells} round-by-seat cells on the scoreboard, ${made} of them made bids`);
+    eq(drift, 0, `${scoring}: every delta and every running total is that mode's formula, to the point`);
+    same(g.totals, running, `${scoring}: and the final totals are the sum of them`);
+    // The made zero is the cell where pure square and square part company by
+    // round size, so the match has to contain one for the line above to have
+    // tested that — said out loud rather than assumed.
+    ok(madeZero > 0, `${scoring}: including ${madeZero} made zero bid(s), the cell the round size reaches`);
+  });
 }
 
 // ===========================================================================
@@ -4451,6 +4720,21 @@ section('Bot — the scoring mode is a parameter, not three strategies');
   // case anywhere in bot.js.
   ok(zeroRate.kachuful >= zeroRate.square,
     `kachuful bids zero at least as often as square (${zeroRate.kachuful} vs ${zeroRate.square} of ${compared})`);
+  // AND THE FOURTH MODE, WHICH IS THE CLAIM AT THE TOP OF THIS SECTION BEING
+  // CASHED. Pure square was added to js/scoring.js after the bidder was
+  // written and the bidder was not edited for it. Its formula differs from
+  // square's in two places — no flat ten, and a made zero that pays by round
+  // size — and both push the same way on a weak hand: a made one is worth a
+  // single point where square pays eleven, and a made zero is worth fourteen
+  // in this seven-card round where square pays ten. So the same 400 hands
+  // must bid zero far more often here than under square, and a bidder with a
+  // table in it — one that had never heard of this mode — would not.
+  ok(zeroRate.puresquare > zeroRate.square * 3,
+    `pure square bids zero far more often than square (${zeroRate.puresquare} vs ${zeroRate.square} of ${compared}), `
+    + 'from the formula alone');
+  eq(scoreRound('puresquare', 1, 1, 7), 1, 'because a made one is worth a point here');
+  eq(scoreRound('square', 1, 1, 7), 11, 'against eleven there');
+  ok(scoreRound('puresquare', 0, 0, 7) > scoreRound('square', 0, 0, 7), 'and a made zero is worth more');
   console.log(`  zero bids per 400 hands: ${SCORING_MODES.map((m) => `${m} ${zeroRate[m]}`).join(', ')}`);
 }
 
@@ -6674,6 +6958,155 @@ section('UI: the score pad, shape and content');
   eq(plural(1, 'card'), '1 card', 'one does not');
   for (let n = 2; n <= 60; n++) {
     eq(plural(n, 'trick'), `${n} tricks`, `plural(${n}) pluralises`);
+  }
+}
+
+// ===========================================================================
+section('UI: a scoring mode, from the lobby chip to the score pad');
+// ===========================================================================
+
+// THE ROUTE A SCORING MODE TAKES TO THE SCREEN, end to end, for every mode
+// there is. The formulas are tested above and the engine's use of them above
+// that; what is left is the part a host actually touches — a chip in the
+// lobby — and the part every player stares at — a cell on the pad. A mode
+// that scored perfectly and could not be selected, or that could be selected
+// and painted a made bid as a miss, passes everything before this.
+//
+// Swept over SCORING_MODES rather than written for the newest one, so the
+// fifth is asked the same questions without this section being edited.
+{
+  const lobby = new GameEngine();
+  seatTable(lobby, ['Ana', 'Ben', 'Cleo']);
+
+  // The scoring row, found by its accessible name rather than by position —
+  // the lobby has three of these rows and they are built by one function.
+  const scoringRow = (root) => walk(root).find((n) => n.getAttribute
+    && n.getAttribute('role') === 'radiogroup' && n.getAttribute('aria-label') === 'Scoring');
+  const chipsOf = (root) => {
+    const row = scoringRow(root);
+    return row ? row.children.filter((c) => c.tag === 'button') : [];
+  };
+
+  const asOwner = draw(baseApp({ pub: lobby.publicState(), priv: lobby.privateStateFor('p0') }));
+  const chips = chipsOf(asOwner.root);
+  same(chips.map((c) => c.text), SCORING_MODES.map((m) => SCORING_LABELS[m].label),
+    'the lobby offers one chip per scoring mode, named from the label table, in the modes\' own order');
+
+  // PRESSING A CHIP ASKS FOR THAT MODE, with the field name the dispatcher
+  // reads. This is the seam the dead-lobby bug lived on — see the note at
+  // 'setConfig' in js/intents.js — crossed here for every chip.
+  chips.forEach((chip, i) => {
+    const before = asOwner.calls.length;
+    chip.click();
+    const fired = asOwner.calls.slice(before);
+    eq(fired.length, 1, `${SCORING_MODES[i]}: its chip does one thing`);
+    eq(fired[0] && fired[0].name, 'setConfig', 'which is to change the config');
+    same(fired[0] && fired[0].args[0], { scoring: SCORING_MODES[i] }, `to { scoring: '${SCORING_MODES[i]}' }`);
+    // And what the lobby asks for, the host grants: the frame the chip would
+    // send goes through the real dispatcher into a real engine and sticks.
+    const g = new GameEngine();
+    seatTable(g, ['Ana', 'Ben', 'Cleo']);
+    const out = applyGameIntent(g, 'p0', { type: 'setConfig', patch: fired[0].args[0] }, 0);
+    ok(out.handled && out.result.ok, `${SCORING_MODES[i]}: the owner's request is accepted`);
+    eq(g.config.scoring, SCORING_MODES[i], 'and the engine is now on that mode');
+    eq(applyGameIntent(g, 'p1', { type: 'setConfig', patch: { scoring: SCORING_MODES[0] } }, 0).result.ok, false,
+      'which a guest cannot change back');
+  });
+
+  // A GUEST SEES THE SAME ROW AND CANNOT PRESS IT.
+  const asGuest = draw(baseApp({ pub: lobby.publicState(), priv: lobby.privateStateFor('p1'), isHost: false }));
+  const guestChips = chipsOf(asGuest.root);
+  eq(guestChips.length, SCORING_MODES.length, 'a guest is shown every mode too');
+  for (const chip of guestChips) chip.click();
+  eq(asGuest.calls.length, 0, 'and pressing any of them does nothing — the scoring is the owner\'s to choose');
+
+  for (const mode of SCORING_MODES) {
+    const g = new GameEngine();
+    seatTable(g, ['Ana', 'Ben', 'Cleo']);
+    g.setConfig('p0', { scoring: mode });
+    const r = draw(baseApp({ pub: g.publicState(), priv: g.privateStateFor('p1'), isHost: false }));
+    const row = chipsOf(r.root);
+    same(row.map((c) => c.getAttribute('aria-checked')), SCORING_MODES.map((m) => String(m === mode)),
+      `${mode}: exactly its own chip reads as chosen, to a screen reader as well as to the eye`);
+    same(row.map((c) => c.hasClass('on')), SCORING_MODES.map((m) => m === mode), 'and is the one lit');
+    // The sentence under the row is the only explanation at the moment of
+    // choosing, so it has to be THIS mode's and not the last one's.
+    const said = scoringRow(r.root).parent.text;
+    ok(said.includes(SCORING_LABELS[mode].blurb), `${mode}: its own blurb is the one shown under the row`);
+    for (const other of SCORING_MODES.filter((m) => m !== mode)) {
+      ok(!said.includes(SCORING_LABELS[other].blurb), `and not ${other}'s`);
+    }
+  }
+
+  // A MODE WITH NO PRESET READS AS CUSTOM, and says so instead of leaving the
+  // preset it was switched from lit.
+  {
+    const g = new GameEngine();
+    seatTable(g, ['Ana', 'Ben', 'Cleo']);
+    g.setConfig('p0', { scoring: 'puresquare' });
+    const r = draw(baseApp({ pub: g.publicState(), priv: g.privateStateFor('p0') }));
+    eq(byClass(r.root, 'preset').filter((p) => p.hasClass('on')).length, 0, 'pure square leaves no preset lit');
+    ok(walk(r.root).some((n) => n.tag === 'p' && /^Custom/.test(n.text)), 'and the lobby calls the game Custom');
+  }
+
+  // --- AND OUT THE OTHER END, ONTO THE PAD -----------------------------------
+  //
+  // A whole match under each mode, with the pad read back at every state.
+  // padCell() colours a completed cell by the SIGN of its points and draws no
+  // tick, so the thing to check is that the colour agrees with the bid: 'made'
+  // when the bid was made, and never 'made' when it was not.
+  for (const mode of SCORING_MODES) {
+    let cells = 0, wrongClass = 0, wrongText = 0, wrongFraction = 0, zeros = 0, negs = 0, mades = 0, pads = 0;
+    let named = 0;
+    playMatch({
+      config: { scoring: mode, trumpMethod: 'rotation', shape: 'downup', hook: false, maxHand: 4 },
+      players: 4, strategy: 'random', shuffleSeed: 21,
+      onState: (g) => {
+        if (g.history.length === 0) return;
+        const pub = g.publicState();
+        const r = draw(baseApp({ pub, priv: g.privateStateFor('p1'), isHost: false, showPad: true }));
+        // The pad can be on screen twice — inline between rounds and again in
+        // the sheet — and both copies have to be right.
+        for (const pad of byClass(r.root, 'pad')) {
+          pads++;
+          if (byClass(pad.parent, 'board-lede').some((n) => n.text.includes(SCORING_LABELS[mode].label))) named++;
+          const rows = byTag(pad, 'tbody')[0].children;
+          g.history.forEach((h, round) => {
+            const tds = rows[round].children.filter((c) => c.tag === 'td');
+            tds.forEach((td, seat) => {
+              cells++;
+              const pts = h.deltas[seat];
+              const made = h.bids[seat] === h.tricks[seat];
+              const ptsNode = byClass(td, 'cell-pts')[0];
+              const want = made ? 'made' : (pts < 0 ? 'neg' : 'zero');
+              if (!ptsNode || !ptsNode.hasClass(want)) wrongClass++;
+              if (!ptsNode || ptsNode.text !== fmtDelta(pts)) wrongText++;
+              if (byClass(td, 'cell-bid')[0].text !== `${h.tricks[seat]}/${h.bids[seat]}`) wrongFraction++;
+              if (ptsNode && ptsNode.hasClass('zero')) zeros++;
+              if (ptsNode && ptsNode.hasClass('neg')) negs++;
+              if (ptsNode && ptsNode.hasClass('made')) mades++;
+            });
+          });
+        }
+      },
+    });
+    ok(cells > 200, `${mode}: ${cells} completed cells read back off ${pads} rendered pads`);
+    eq(named, pads, `${mode}: every pad says which scoring it is keeping, by the name on the chip`);
+    eq(wrongClass, 0, `${mode}: a cell is painted as made exactly when the bid was made`);
+    eq(wrongText, 0, `${mode}: and shows the points the engine recorded, sign and all`);
+    eq(wrongFraction, 0, `${mode}: beside what was taken over what was bid`);
+    ok(mades > 0, `${mode}: with made bids on the pad to check (${mades})`);
+    // WHAT A MISS LOOKS LIKE IS THE MODE. Where a miss is free it is a quiet
+    // zero and nothing on the pad is ever red; where it costs, it is red and
+    // there is no such thing as a zero cell at all — every completed cell is
+    // either points won or points lost.
+    if (PENALISING.includes(mode)) {
+      ok(negs > 0, `${mode}: misses are drawn as losses (${negs})`);
+      eq(zeros, 0, `${mode}: and no completed cell is ever a zero — a miss always costs something here`);
+    } else {
+      ok(zeros > 0, `${mode}: misses are drawn as zeros (${zeros})`);
+      eq(negs, 0, `${mode}: and nothing on the pad is ever a loss`);
+    }
   }
 }
 
@@ -12055,19 +12488,46 @@ section('The rules sheet says what the code actually does');
   // rather than by position. Two bullets say "a made four scores N" with
   // different N, so matching across the whole sheet would find whichever came
   // first and pass for the wrong reason.
-  const bullets = [...dialog.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((m) => m[1].replace(/<[^>]*>/g, ''));
+  //
+  // BY ITS BOLD LEAD-IN, NOT BY CONTAINING THE WORD. It was a substring search
+  // over the whole bullet, and that was safe for exactly as long as no bullet
+  // mentioned another mode by name. The pure-square bullet says its penalty is
+  // "exactly as in Squared" — so a search for 'Squared' has two bullets to
+  // choose from and returns whichever comes first in the file, which is the
+  // right one today by the accident of ordering. Every bullet in the sheet
+  // opens with the thing it is about in <b>…</b>; that is what is matched.
+  const items = [...dialog.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((m) => ({
+    lead: ((m[1].match(/^\s*<b>([^<]*)<\/b>/) || [])[1] || '').trim(),
+    text: m[1].replace(/<[^>]*>/g, ''),
+  }));
+  const bullets = items.map((i) => i.text);
   ok(bullets.length >= 6, `${bullets.length} bullets in the sheet`);
-  const bulletFor = (word) => bullets.find((b) => b.includes(word)) || '';
+  const bulletFor = (word) => (items.find((i) => i.lead === word) || { text: '' }).text;
+  eq(items.filter((i) => i.lead === '').length, 0, 'every bullet opens with a bold lead-in, so every one can be found by it');
+  eq(new Set(items.map((i) => i.lead)).size, items.length, 'and no two share one');
 
-  // SCORING_MODES is the source of truth for which modes exist, so a fourth
-  // one added without a bullet fails here. The words are the sheet's own
-  // spelling — 'square' is presented as "Squared" — and that mapping is the
-  // only thing in this section written by hand.
-  const BULLET_WORD = { kachuful: 'Kachuful', standard: 'Standard', square: 'Squared' };
+  // SCORING_MODES is the source of truth for which modes exist, so a mode
+  // added without a bullet fails here — which is exactly what happened when
+  // the fourth one landed, and is why it has one. The words are the sheet's
+  // own spelling — 'square' is presented as "Squared" — and that mapping is
+  // the only thing in this section written by hand.
+  const BULLET_WORD = { kachuful: 'Kachuful', standard: 'Standard', square: 'Squared', puresquare: 'Pure square' };
   for (const mode of SCORING_MODES) {
     ok(BULLET_WORD[mode], `the sheet has a name for the '${mode}' mode`);
     ok(bulletFor(BULLET_WORD[mode]).length > 40, `and a bullet describing ${BULLET_WORD[mode]}`);
   }
+  // The sheet lists the modes in the order the lobby offers them, so a host
+  // reading down one can read across the other.
+  {
+    const order = SCORING_MODES.map((mode) => items.findIndex((i) => i.lead === BULLET_WORD[mode]));
+    ok(order.every((at, k) => at !== -1 && (k === 0 || at === order[k - 1] + 1)),
+      'the scoring bullets appear together and in the lobby\'s order');
+  }
+  // The lobby chip and the sheet are the two places a host meets a mode's
+  // name, and the new one is spelled the same in both. (Square is the
+  // historical exception — "Square" on the chip, "Squared" in the sheet — and
+  // is left alone rather than tidied into a third spelling.)
+  eq(BULLET_WORD.puresquare, SCORING_LABELS.puresquare.label, 'the sheet calls pure square what the lobby chip calls it');
 
   // A round size of ten, because that is the round the Kachuful bullet talks
   // about and the two modes that ignore roundSize do not care.
@@ -12083,6 +12543,14 @@ section('The rules sheet says what the code actually does');
     ['square', /Out by one costs (\d+)/, -scoreRound('square', 4, 3, SIZE)],
     ['square', /out by two costs (\d+)/, -scoreRound('square', 4, 2, SIZE)],
     ['square', /out by three costs (\d+)/, -scoreRound('square', 4, 1, SIZE)],
+    // Pure square: the made bid without the ten, the made one that shows how
+    // little a small bid is worth, the made zero that pays by round size, and
+    // one penalty — the rest being Square's, which is asserted below as an
+    // equality rather than by repeating its three numbers here.
+    ['puresquare', /a made four scores (\d+)/, scoreRound('puresquare', 4, 4, SIZE)],
+    ['puresquare', /a made one scores just (\d+)/, scoreRound('puresquare', 1, 1, SIZE)],
+    ['puresquare', /ducking a ten-card round worth (\d+)/, scoreRound('puresquare', 0, 0, SIZE)],
+    ['puresquare', /out by two costs (\d+)/, -scoreRound('puresquare', 4, 2, SIZE)],
   ];
   for (const [mode, re, expected] of CLAIMS) {
     const found = bulletFor(BULLET_WORD[mode]).match(re);
@@ -12161,9 +12629,67 @@ section('The rules sheet says what the code actually does');
   ok(cases > 400, `${cases} (bid, taken, round size) combinations swept`);
   eq(kachufulMissNonZero, 0, 'Kachuful: "missing costs nothing" holds for every miss there is');
   ok(negatives.square > 0, `Squared goes negative in ${negatives.square} of them`);
-  eq(negatives.kachuful + negatives.standard, 0,
-    'and it is "the ONLY mode where a score can go negative" — the other two never do');
   eq(symmetryBreaks, 0, 'Squared: "over and under cost the same", at every distance');
+
+  // --- which modes take points away, said by the right bullets and no others --
+  //
+  // THE SHEET USED TO CALL SQUARED "the only mode where a score can go
+  // negative", and this section used to check that it was. Both were right,
+  // and both would have gone on being asserted after a second such mode
+  // arrived: the test compared two NAMED modes against zero and never asked
+  // about any other. So the claim is no longer "Squared is the only one". It
+  // is that each bullet says a miss costs points exactly when its formula
+  // makes it so — derived per mode, so a fifth mode is asked the same question
+  // without anybody remembering to.
+  for (const mode of SCORING_MODES) {
+    const text = bulletFor(BULLET_WORD[mode]);
+    const bites = negatives[mode] > 0;
+    eq(/takes? points away/i.test(text), bites,
+      `${BULLET_WORD[mode]}: the bullet ${bites ? 'says' : 'does not say'} that missing takes points away`);
+  }
+  // And nobody is called the only one of anything while there are two.
+  const biting = SCORING_MODES.filter((mode) => negatives[mode] > 0);
+  eq(biting.length, 2, `${biting.length} modes can go negative: ${biting.join(', ')}`);
+  for (const mode of biting) {
+    ok(!/\bonly (mode|one)\b/i.test(bulletFor(BULLET_WORD[mode])),
+      `${BULLET_WORD[mode]}: and is not described as the only mode that does`);
+  }
+
+  // --- pure square's three sentences that are not numbers ---------------------
+  {
+    const pure = bulletFor(BULLET_WORD.puresquare);
+    // "exactly as in Squared" — so ask both formulas about every miss.
+    let differs = 0, misses = 0;
+    for (let size = 1; size <= 10; size++) {
+      for (let bid = 0; bid <= size; bid++) {
+        for (let actual = 0; actual <= size; actual++) {
+          if (actual === bid) continue;
+          misses++;
+          if (scoreRound('puresquare', bid, actual, size) !== scoreRound('square', bid, actual, size)) differs++;
+        }
+      }
+    }
+    ok(misses > 300, `${misses} misses compared between the two square modes`);
+    eq(/exactly as in Squared/.test(pure), differs === 0,
+      'the bullet says its penalty is exactly Squared\'s, and for every miss there is, it is');
+    // "no ten on top" — the ten being the one Squared pays.
+    let gap = 0;
+    for (let bid = 1; bid <= 10; bid++) {
+      if (scoreRound('square', bid, bid, SIZE) - scoreRound('puresquare', bid, bid, SIZE) !== 10) gap++;
+    }
+    eq(/no ten on top/.test(pure), gap === 0, 'and that there is no ten on top, which is the whole of the difference on a made bid');
+    // "twice the round size" — at every size, not just the ten it works out.
+    let notTwice = 0;
+    for (let size = 1; size <= 17; size++) if (scoreRound('puresquare', 0, 0, size) !== 2 * size) notTwice++;
+    eq(/twice the round size/.test(pure), notTwice === 0, 'and that a made zero pays twice the round size, in every round');
+    // "What a bid can win you is what missing it by that much costs."
+    let lopsided = 0;
+    for (let bid = 1; bid <= 10; bid++) {
+      if (scoreRound('puresquare', bid, bid, SIZE) !== -scoreRound('puresquare', bid, 0, SIZE)) lopsided++;
+    }
+    eq(/what missing it by that much costs/.test(pure), lopsided === 0,
+      'and that a bid wins exactly what missing it by that much costs');
+  }
 
   // --- the hook, which is a toggle and must not be stated as a law ---------
   // The sheet cannot know a given room's config, so the one honest thing it

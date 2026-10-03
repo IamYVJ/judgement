@@ -183,7 +183,7 @@ export class GameEngine {
     this.plan = [];          // hand size of every round, in order
     this.roundIndex = -1;    // -1 until the first round is dealt
     this.dealerSeat = 0;
-    this.totals = [];        // running score per seat; goes negative under square
+    this.totals = [];        // running score per seat; goes negative under the square modes
     this.history = [];       // one frozen record per completed round
 
     // --- the round ---

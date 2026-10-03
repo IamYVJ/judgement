@@ -778,7 +778,7 @@ function configCard(app, intents, owner) {
     }, p.label))),
     el('p', { class: 'hint' }, preset
       ? PRESETS.find((p) => p.id === preset).blurb
-      // Not an error state. The presets are three points in a space of 54
+      // Not an error state. The presets are three points in a space of 72
       // games and wandering off them is the normal way to use the toggles.
       : 'Custom — your own corner of the rules.'),
 
@@ -1561,9 +1561,11 @@ function padTrump(pub, r, done) {
 function padCell(pub, done, now, i) {
   if (done) {
     const pts = done.deltas[i];
-    // The SIGN carries made-versus-missed, and no tick is needed. In all three
+    // The SIGN carries made-versus-missed, and no tick is needed. In all four
     // modes a made bid scores strictly positive and a miss scores zero or
-    // negative — 10*bid, 5*size, 10+bid, 10+bid^2 against 0 or −(error^2).
+    // negative — 10*bid, 5*size, 10+bid, 10+bid^2, bid^2, 2*size against 0 or
+    // −(error^2). The two that look like they could be zero cannot: bid^2 is
+    // only ever paid for a bid of one or more, and a round has at least a card.
     // That is a property of js/scoring.js, it is under test there, and if it
     // ever stops being true the suite says so before this quietly breaks.
     const cls = pts > 0 ? 'made' : (pts === 0 ? 'zero' : 'neg');

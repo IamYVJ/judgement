@@ -83,7 +83,7 @@
 // worker does not precache itself, which is also the only reason this can be
 // computed at all — and the only reason `npm run stamp` can write to this file
 // without moving the target it just measured.
-const SHELL_STAMP = '3263698c882c';
+const SHELL_STAMP = '28f61ead9e5c';
 
 // The stamp is the version. Keeping the 'judgement-shell-' prefix matters —
 // the activate handler below deletes caches by it, and deleting by prefix is

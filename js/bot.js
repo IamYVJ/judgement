@@ -247,7 +247,7 @@ const lowest = (codes) => pick(codes, rankValue, 'min');
 //  THE BIDDING STRATEGY IS NOT IN THIS FILE. That is the whole design.
 //
 //  A hardcoded table of "bid this with that hand" would have to be written
-//  three times — once per scoring mode — and the brief is explicit that it
+//  four times — once per scoring mode — and the brief is explicit that it
 //  must not be. So the bot does the only thing that keeps one source of truth:
 //  it estimates a PROBABILITY DISTRIBUTION over how many tricks the hand will
 //  take, then asks js/scoring.js what each candidate bid is worth against that
@@ -274,10 +274,20 @@ const lowest = (codes) => pick(codes, rankValue, 'min');
 //              a variance term, and minimising it pulls the bid towards the
 //              middle of the distribution and away from its tail.
 //              Conservative and accurate, because the arithmetic is.
+//    puresquare  bid^2 and no flat ten, with square's penalty. Nothing is paid
+//              for merely being right, so a made one is worth a single point
+//              against a miss that costs at least as much — and the made zero
+//              pays 2 x roundSize, which on a weak hand in a big round is the
+//              only bid on the table worth having. So this mode bids zero
+//              about as often as kachuful does and for kachuful's reason,
+//              while keeping square's caution everywhere else.
 //
-//  A FOURTH SCORING MODE WOULD NEED NO CHANGE HERE AT ALL. That is the test of
-//  whether this was done properly, and scripts/test-engine.mjs runs it: each
-//  mode's behaviour is asserted from its formula, never from a constant here.
+//  THE FOURTH SCORING MODE NEEDED NO CHANGE HERE AT ALL. That was written as a
+//  prediction — "a fourth mode would need no change" — and as the test of
+//  whether this was done properly. puresquare is that fourth mode: it was
+//  added in js/scoring.js and this file was not touched except for the
+//  paragraph above. scripts/test-engine.mjs asserts each mode's behaviour from
+//  its formula, never from a constant here.
 //
 // ===========================================================================
 
@@ -285,7 +295,7 @@ const lowest = (codes) => pick(codes, rankValue, 'min');
  * Everything chooseBid() needs, read off the two views.
  *
  * Separate from chooseBid() so the harness can hand-build a context and sweep
- * one axis at a time — the same hand under three scoring modes, or with and
+ * one axis at a time — the same hand under every scoring mode, or with and
  * without the hook — which is impossible if the context is trapped inside.
  */
 export function bidContext(pub, priv) {
@@ -659,8 +669,8 @@ export function chooseBid(hand, ctx) {
  * more-is-better game would not have at all.
  *
  *   'duck'  at or over the bid. Every further trick is a disaster — under
- *           `square` it is literally points off the board, and under all three
- *           it throws away a round that was already won. The bot must actively
+ *           the square modes it is literally points off the board, and under
+ *           all four it throws away a round that was already won. The bot must actively
  *           get out of the way, and ducking is not "play your lowest card", it
  *           is "play the highest card that does not win": the low cards are
  *           what will duck the remaining tricks, and the high ones are the
